@@ -1,6 +1,6 @@
-"""PRTS Agent 入口 —— FastAPI HTTP 服务,默认 :8788。
+"""PRTS Agent 入口 —— FastAPI HTTP 服务,默认 :4788。
 
-P0 阶段只暴露 /health,真正的 Agent loop 在 P1 阶段填充。
+P1 阶段:暴露 /agent/v1/converse 走 SSE 流式 LLM。
 """
 
 from __future__ import annotations
@@ -11,9 +11,12 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
+from .api import router as agent_router
+
 load_dotenv()
 
 app = FastAPI(title="PRTS Agent", version="0.1.0")
+app.include_router(agent_router)
 
 
 @app.get("/health")
