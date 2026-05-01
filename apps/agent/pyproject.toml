@@ -1,0 +1,29 @@
+[project]
+name = "prts-agent"
+version = "0.1.0"
+description = "PRTS Python Agent — FastAPI + asyncio LLM agent loop"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "sse-starlette>=2.1",
+    "openai>=1.60",
+    "anthropic>=0.42",
+    "fastmcp>=3.0",
+    "aiosqlite>=0.20",
+    "python-dotenv>=1.0",
+    "prts",
+]
+
+[project.scripts]
+prts-agent = "prts_agent.main:run"
+
+[tool.uv.sources]
+prts = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/prts_agent"]

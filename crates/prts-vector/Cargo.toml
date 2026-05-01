@@ -1,0 +1,15 @@
+[package]
+name = "prts-vector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PRTS 向量检索引擎(P7 阶段接 sqlite-vec)"
+
+[dependencies]
+# P7 阶段接通后填充:rusqlite + sqlite-vec / hnsw_rs / rmcp
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[lib]
+path = "src/lib.rs"

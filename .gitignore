@@ -1,0 +1,40 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.claude/
+venv/
+.uv-cache/
+
+# rust
+target/
+Cargo.lock
+
+# build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# env / secrets
+.env
+.env.local
+*.local
+
+# data / runtime
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+logs/
+*.log
+
+# editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
