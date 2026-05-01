@@ -1,19 +1,21 @@
 """PRTS Agent 入口 —— FastAPI HTTP 服务,默认 :4788。
 
-启动序列(P3):
+启动序列:
 1. 解析 / 种子 ``~/.prts/workspace``
 2. 打开 SQLite,迁移到最新 schema
 3. 实例化 LLM 客户端(根据 LLM_PROVIDER 选 OpenAI / Anthropic)
-4. 构造 ``ToolRegistry``,扫描 ``workspace/skills/*.py`` 把 @skill 注册进来
-5. 构造 ``AgentRuntimeBridge`` 并 ``prts.runtime.set_runtime(...)`` 注入 SDK
-6. 实例化 ``AgentLoop``,挂到 ``app.state``,供路由使用
+4. 构造 ``ToolRegistry`` + ``AgentRuntimeBridge``,把 bridge 注入 prts SDK
+5. **(P4)** 启动 ``workspace/mcp.json`` 里的外部 MCP server,把它们的工具
+   以 ``<server>__<tool>`` 注册进 registry(``source="mcp"``)
+6. 扫描 ``workspace/skills/*.py`` 把 @skill 注册进来(``source="skill"``)
+7. 实例化 ``AgentLoop``,挂到 ``app.state``,供路由使用
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -24,6 +26,7 @@ import prts.runtime as prts_runtime
 from .api import router as agent_router
 from .llm import build_llm_client
 from .loop import AgentLoop
+from .mcp import MCPConfigError, MCPManager, load_mcp_config
 from .memory import SqliteStore, init_store
 from .runtime import AgentRuntimeBridge
 from .skills import load_user_skills
@@ -49,6 +52,21 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     )
     prts_runtime.set_runtime(bridge)
 
+    # MCP 先于 skill 启动:skill loader 现在只清 source="skill" 的工具,
+    # 所以 MCP 注册的工具不会被 skill 重扫连带杀掉。
+    parent_stack = AsyncExitStack()
+    await parent_stack.__aenter__()
+    mcp_manager = MCPManager(workspace, tools, parent_stack)
+
+    try:
+        mcp_config = load_mcp_config(workspace)
+    except MCPConfigError as exc:
+        logger.error("mcp.json 解析失败,将以空配置启动: %s", exc)
+        from .mcp import MCPConfig
+
+        mcp_config = MCPConfig()
+    await mcp_manager.start_all(mcp_config)
+
     loaded = load_user_skills(workspace, tools)
 
     agent_loop = AgentLoop(store=store, llm=llm_client, tools=tools)
@@ -60,21 +78,34 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     app.state.runtime_bridge = bridge
     app.state.skills_loaded = loaded
     app.state.agent_loop = agent_loop
+    app.state.mcp_manager = mcp_manager
 
+    mcp_states = mcp_manager.states()
+    mcp_ready = sum(1 for s in mcp_states if s.status == "ready")
+    mcp_errors = sum(1 for s in mcp_states if s.status == "error")
     logger.info(
-        "agent ready | workspace=%s db=%s skills=%d tasks=%d errors=%d",
+        "agent ready | workspace=%s db=%s skills=%d tasks=%d skill_errors=%d "
+        "mcp_servers=%d (ready=%d error=%d)",
         workspace,
         store.db_path,
         len(loaded.skills),
         len(loaded.tasks),
         len(loaded.errors),
+        len(mcp_states),
+        mcp_ready,
+        mcp_errors,
     )
     for err in loaded.errors:
         logger.warning("skill load error in %s: %s", err.file, err.message)
+    for state in mcp_states:
+        if state.status == "error":
+            logger.warning("MCP server %r error: %s", state.name, state.error)
 
     try:
         yield
     finally:
+        # 先关 MCP(可能要等子进程优雅退出),再清 SDK runtime 引用
+        await parent_stack.aclose()
         prts_runtime.set_runtime(None)
 
 
@@ -88,6 +119,8 @@ async def health() -> dict[str, object]:
     store = getattr(app.state, "store", None)
     tools = getattr(app.state, "tools", None)
     loaded = getattr(app.state, "skills_loaded", None)
+    mcp_manager = getattr(app.state, "mcp_manager", None)
+    mcp_states = mcp_manager.states() if mcp_manager else []
     return {
         "service": "prts-agent",
         "ok": True,
@@ -99,6 +132,9 @@ async def health() -> dict[str, object]:
         "skills_loaded": len(loaded.skills) if loaded else 0,
         "skills_errors": len(loaded.errors) if loaded else 0,
         "tasks_loaded": len(loaded.tasks) if loaded else 0,
+        "mcp_servers": len(mcp_states),
+        "mcp_servers_ready": sum(1 for s in mcp_states if s.status == "ready"),
+        "mcp_servers_error": sum(1 for s in mcp_states if s.status == "error"),
         "ts": datetime.now(timezone.utc).isoformat(),
     }
 

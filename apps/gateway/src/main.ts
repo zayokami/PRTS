@@ -28,6 +28,12 @@ app.get("/skills", async (_req, reply) => {
   reply.code(resp.status).type("application/json").send(await resp.text());
 });
 
+// 透传到 agent: GET /agent/v1/mcp/servers
+app.get("/mcp/servers", async (_req, reply) => {
+  const resp = await fetch(`${AGENT_URL}/agent/v1/mcp/servers`);
+  reply.code(resp.status).type("application/json").send(await resp.text());
+});
+
 interface InboundUserFrame {
   type: "user";
   content: string;

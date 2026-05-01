@@ -58,6 +58,21 @@ class SkillsResponse(BaseModel):
     skills: list[SkillInfo]
 
 
+class MCPServerInfo(BaseModel):
+    name: str
+    status: str
+    disabled: bool
+    error: str | None
+    tool_names: list[str]
+    tools_count: int
+    started_at: str | None
+    command: str
+
+
+class MCPServersResponse(BaseModel):
+    servers: list[MCPServerInfo]
+
+
 def _store(req: Request) -> SqliteStore:
     return req.app.state.store  # type: ignore[no-any-return]
 
@@ -143,5 +158,28 @@ async def list_skills(request: Request) -> SkillsResponse:
                 source=t.source,
             )
             for t in tools.all()
+        ]
+    )
+
+
+@router.get("/mcp/servers", response_model=MCPServersResponse)
+async def list_mcp_servers(request: Request) -> MCPServersResponse:
+    """已启动 / 失败 / 禁用的外部 MCP server 状态快照。"""
+    mcp_manager = getattr(request.app.state, "mcp_manager", None)
+    if mcp_manager is None:
+        return MCPServersResponse(servers=[])
+    return MCPServersResponse(
+        servers=[
+            MCPServerInfo(
+                name=s.name,
+                status=s.status,
+                disabled=s.disabled,
+                error=s.error,
+                tool_names=s.tool_names,
+                tools_count=s.tools_count,
+                started_at=s.started_at,
+                command=s.command,
+            )
+            for s in mcp_manager.states()
         ]
     )

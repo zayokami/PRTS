@@ -4,7 +4,8 @@
 - 工具名 = ``<server_name>__<raw_tool_name>``,固定带前缀,LLM 看到的就是这个名字。
 - 调用前 ``asyncio.wait_for`` 包一层超时,server 卡住时不会无限阻塞 agent loop。
 - ``result.isError == True``(server 自报错) → 抛 ``RuntimeError``,内容来自 text 块。
-- ``result.structuredContent``(MCP 2025-06-18+) 优先 → 直接返回 dict。
+- ``result.structuredContent``(MCP 2025-06-18+) 优先 → 直接返回 dict;
+  ``{"result": value}`` 这种 FastMCP 自动壳被脱掉。
 - 否则展平 ``content`` 块:
   * 仅 1 个 ``TextContent`` → 返回字符串
   * 多块 / 非文本(image/embedded resource) → 返回 list[dict],由 runner 端 JSON 化
@@ -109,6 +110,15 @@ def make_mcp_invoker(
 
         structured = getattr(result, "structuredContent", None)
         if structured is not None:
+            # FastMCP 把"非 dict 返回类型"(比如 ``-> str`` / ``-> int``) 的工具
+            # 结果按 spec 包成 ``{"result": value}`` 以满足生成的 outputSchema。
+            # LLM 看到这个一层壳没有意义,统一脱掉。
+            if (
+                isinstance(structured, dict)
+                and len(structured) == 1
+                and "result" in structured
+            ):
+                return structured["result"]
             return structured
         return _flatten_content(getattr(result, "content", []) or [])
 
