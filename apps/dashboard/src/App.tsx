@@ -12,6 +12,8 @@ type Frame =
   | { type: "done" }
   | { type: "error"; message: string };
 
+const SESSION_KEY = "prts.session_id";
+
 export default function App() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
@@ -21,8 +23,10 @@ export default function App() {
   const listRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
+    const stored = localStorage.getItem(SESSION_KEY);
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/chat`);
+    const qs = stored ? `?session_id=${encodeURIComponent(stored)}` : "";
+    const ws = new WebSocket(`${proto}://${location.host}/ws/chat${qs}`);
     wsRef.current = ws;
 
     ws.onmessage = (ev) => {
@@ -30,8 +34,18 @@ export default function App() {
       try { frame = JSON.parse(ev.data); } catch { return; }
 
       if (frame.type === "ready") {
-        setSessionId(frame.session_id);
-        setStatus("ready");
+        const sid = frame.session_id;
+        setSessionId(sid);
+        localStorage.setItem(SESSION_KEY, sid);
+        // seed UI from server-side history
+        fetch(`/api/sessions/${encodeURIComponent(sid)}/history`)
+          .then((r) => (r.ok ? r.json() : { messages: [] }))
+          .then((j: { messages: { role: Role; content: string }[] }) => {
+            const seed = (j.messages ?? []).filter((m) => m.role === "user" || m.role === "assistant");
+            setMessages(seed.map((m) => ({ role: m.role, content: m.content })));
+            setStatus("ready");
+          })
+          .catch(() => setStatus("ready"));
       } else if (frame.type === "token") {
         setMessages((prev) => {
           const next = [...prev];
@@ -73,6 +87,11 @@ export default function App() {
     setStatus("streaming");
   };
 
+  const newSession = () => {
+    localStorage.removeItem(SESSION_KEY);
+    location.reload();
+  };
+
   return (
     <main style={S.main}>
       <header style={S.header}>
@@ -80,6 +99,9 @@ export default function App() {
         <span style={S.meta}>
           {status} {sessionId && `· ${sessionId.slice(0, 8)}`}
         </span>
+        <button type="button" onClick={newSession} style={S.newBtn} title="开新会话">
+          新会话
+        </button>
       </header>
 
       <div ref={listRef} style={S.list}>
@@ -113,7 +135,8 @@ const S: Record<string, React.CSSProperties> = {
   main: { display: "flex", flexDirection: "column", height: "100vh", fontFamily: "ui-monospace, monospace", background: "#0d1117", color: "#e6edf3" },
   header: { display: "flex", alignItems: "baseline", gap: 12, padding: "12px 20px", borderBottom: "1px solid #30363d" },
   title: { margin: 0, fontSize: 18, letterSpacing: 2 },
-  meta: { fontSize: 12, opacity: 0.6 },
+  meta: { fontSize: 12, opacity: 0.6, flex: 1 },
+  newBtn: { fontSize: 12, padding: "4px 10px", background: "transparent", color: "#e6edf3", border: "1px solid #30363d", borderRadius: 4, cursor: "pointer", fontFamily: "inherit" },
   list: { flex: 1, overflowY: "auto", padding: "16px 20px", display: "flex", flexDirection: "column", gap: 12 },
   hint: { opacity: 0.4, textAlign: "center", marginTop: 40 },
   row: { display: "flex", flexDirection: "column", gap: 4, maxWidth: "80ch" },
