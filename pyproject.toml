@@ -3,6 +3,8 @@ name = "prts-monorepo"
 version = "0.1.0"
 description = "PRTS monorepo workspace root (uv)"
 requires-python = ">=3.12"
+authors = [{ name = "zayoka" }]
+license = { text = "MIT" }
 dependencies = [
     "prts",
     "prts-agent",

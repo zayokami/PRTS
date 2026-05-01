@@ -3,6 +3,8 @@ name = "prts"
 version = "0.1.0"
 description = "PRTS SDK — 用户在 workspace/skills/*.py 里 from prts import ... 的脚本 API。仅本地 monorepo 包,不发 PyPI。"
 requires-python = ">=3.12"
+authors = [{ name = "zayoka" }]
+license = { text = "MIT" }
 dependencies = [
     "fastmcp>=3.0",
 ]

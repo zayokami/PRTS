@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "description": "PRTS — local-first personal AI assistant inspired by Arknights & OpenClaw",
+  "author": "zayoka",
+  "license": "MIT",
   "scripts": {
     "dev": "concurrently -n dashboard,gateway,agent -c blue,green,yellow \"pnpm --filter dashboard dev\" \"pnpm --filter gateway dev\" \"python -m uv run --project apps/agent prts-agent\"",
     "build": "pnpm --filter dashboard build && pnpm --filter gateway build",

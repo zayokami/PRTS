@@ -3,6 +3,8 @@ name = "prts-agent"
 version = "0.1.0"
 description = "PRTS Python Agent — FastAPI + asyncio LLM agent loop"
 requires-python = ">=3.12"
+authors = [{ name = "zayoka" }]
+license = { text = "MIT" }
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
