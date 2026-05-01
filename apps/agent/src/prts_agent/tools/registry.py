@@ -58,7 +58,20 @@ class ToolRegistry:
         return list(self._tools.keys())
 
     def clear(self) -> None:
+        """全部清掉。仅用于测试 / 整体重置;运行期请用 ``unregister_by_source``。"""
         self._tools.clear()
+
+    def unregister_by_source(self, source: str) -> int:
+        """只删某个来源的工具,保留其他来源。
+
+        skill loader 重新扫描 .py 时只想清自己的 @skill 注册,不能连带杀掉
+        启动期接进来的 MCP 工具 —— 否则 MCP server 还活着但 LLM 看不到它的工具。
+        返回删除条数,方便调用方记日志。
+        """
+        victims = [name for name, t in self._tools.items() if t.source == source]
+        for name in victims:
+            del self._tools[name]
+        return len(victims)
 
     async def invoke(self, name: str, arguments: dict[str, Any]) -> Any:
         tool = self._tools.get(name)

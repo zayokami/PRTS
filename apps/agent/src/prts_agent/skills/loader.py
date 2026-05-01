@@ -105,7 +105,11 @@ def load_user_skills(workspace_dir: Path, registry: "ToolRegistry") -> LoadedSki
 
     _reset_for_tests()
     _purge_user_modules()
-    registry.clear()
+    # 只清 skill 来源 —— P4 起 registry 里还有 source="mcp" 的外部工具,
+    # 它们由 MCPManager 在 lifespan 阶段注册,不该被 skill 重扫连带清掉。
+    removed = registry.unregister_by_source("skill")
+    if removed:
+        logger.debug("cleared %d previously-registered skill tool(s)", removed)
 
     skills_dir = workspace_dir / "skills"
     files = _iter_skill_files(skills_dir)
