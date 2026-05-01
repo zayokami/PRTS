@@ -1,8 +1,10 @@
 """Agent HTTP 路由。
 
-P1: /agent/v1/converse 单轮 LLM 流式。
-P2: 接 SQLite 持久化 + workspace markdown 注入 system prompt;
-    新增 GET /agent/v1/sessions/{id}/history 给前端在重连时拉历史。
+P3:
+- ``POST /agent/v1/converse`` 改走 ``AgentLoop``,SSE 事件类型扩到
+  ``token`` / ``tool_call`` / ``tool_result`` / ``notify`` / ``done`` / ``error``
+- ``GET  /agent/v1/sessions/{id}/history`` 仍然返回 user/assistant 消息
+- ``GET  /agent/v1/skills`` 列已注册的 skill(LLM 看到的工具面)
 """
 
 from __future__ import annotations
@@ -10,14 +12,15 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from ..llm import ChatMessage, build_llm_client
+from ..loop import AgentLoop
 from ..memory import SqliteStore
+from ..tools import ToolRegistry
 from ..workspace import load_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -44,50 +47,51 @@ class HistoryResponse(BaseModel):
     messages: list[HistoryMessage]
 
 
+class SkillInfo(BaseModel):
+    name: str
+    description: str | None
+    input_schema: dict[str, Any]
+    source: str
+
+
+class SkillsResponse(BaseModel):
+    skills: list[SkillInfo]
+
+
 def _store(req: Request) -> SqliteStore:
     return req.app.state.store  # type: ignore[no-any-return]
 
 
+def _tools(req: Request) -> ToolRegistry:
+    return req.app.state.tools  # type: ignore[no-any-return]
+
+
+def _loop(req: Request) -> AgentLoop:
+    return req.app.state.agent_loop  # type: ignore[no-any-return]
+
+
 @router.post("/converse")
 async def converse(req: ConverseRequest, request: Request) -> EventSourceResponse:
-    store = _store(request)
     workspace_dir = request.app.state.workspace_dir
-
-    await store.ensure_session(req.session_id, channel=req.channel, user_ref=req.user_ref)
-    await store.append_message(req.session_id, "user", req.content)
-
-    history = await store.history(req.session_id)
     system_prompt = load_system_prompt(workspace_dir)
-
-    messages: list[ChatMessage] = []
-    if system_prompt:
-        messages.append(ChatMessage(role="system", content=system_prompt))
-    messages.extend(
-        ChatMessage(role=m.role, content=m.content)
-        for m in history
-        if m.role in ("user", "assistant")
-    )
-
-    client = build_llm_client()
+    loop = _loop(request)
 
     async def event_stream() -> AsyncIterator[dict[str, str]]:
-        assistant_text = ""
         try:
-            async for token in client.stream_chat(messages):
-                assistant_text += token
-                yield {"event": "token", "data": json.dumps({"text": token})}
+            async for evt in loop.converse(
+                session_id=req.session_id,
+                user_content=req.content,
+                system_prompt=system_prompt,
+                channel=req.channel,
+                user_ref=req.user_ref,
+            ):
+                yield {"event": evt["event"], "data": json.dumps(evt["data"], ensure_ascii=False)}
         except Exception as exc:  # noqa: BLE001
-            logger.exception("LLM stream failed")
+            logger.exception("converse loop failed")
             yield {
                 "event": "error",
                 "data": json.dumps({"message": str(exc), "type": type(exc).__name__}),
             }
-            return
-        finally:
-            if assistant_text:
-                await store.append_message(req.session_id, "assistant", assistant_text)
-
-        yield {"event": "done", "data": json.dumps({"session_id": req.session_id})}
 
     return EventSourceResponse(event_stream())
 
@@ -103,4 +107,20 @@ async def get_history(session_id: str, request: Request) -> HistoryResponse:
             for m in rows
             if m.role in ("user", "assistant")
         ],
+    )
+
+
+@router.get("/skills", response_model=SkillsResponse)
+async def list_skills(request: Request) -> SkillsResponse:
+    tools = _tools(request)
+    return SkillsResponse(
+        skills=[
+            SkillInfo(
+                name=t.name,
+                description=t.description,
+                input_schema=t.input_schema,
+                source=t.source,
+            )
+            for t in tools.all()
+        ]
     )

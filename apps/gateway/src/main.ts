@@ -22,17 +22,25 @@ app.get<{ Params: { id: string } }>("/sessions/:id/history", async (req, reply) 
   reply.code(resp.status).type("application/json").send(await resp.text());
 });
 
+// 透传到 agent: GET /agent/v1/skills
+app.get("/skills", async (_req, reply) => {
+  const resp = await fetch(`${AGENT_URL}/agent/v1/skills`);
+  reply.code(resp.status).type("application/json").send(await resp.text());
+});
+
 interface InboundUserFrame {
   type: "user";
   content: string;
 }
 
-interface OutboundFrame {
-  type: "ready" | "token" | "done" | "error";
-  text?: string;
-  message?: string;
-  session_id?: string;
-}
+type OutboundFrame =
+  | { type: "ready"; session_id: string }
+  | { type: "token"; text: string }
+  | { type: "tool_call"; id: string; name: string; arguments: unknown }
+  | { type: "tool_result"; id: string; name: string; result?: unknown; error?: unknown }
+  | { type: "notify"; message: string; kind?: string; payload?: unknown }
+  | { type: "done" }
+  | { type: "error"; message: string };
 
 /** 解析 SSE: `event: x\ndata: {...}\n\n` —— 上游 sse-starlette 用 CRLF,调用方需先规范化。 */
 function* parseSseChunks(buffer: string): Generator<{ event: string; data: string }, string> {
@@ -118,20 +126,33 @@ app.get<{ Querystring: { session_id?: string } }>(
           let result = gen.next();
           while (!result.done) {
             const { event, data } = result.value;
-            if (event === "token") {
-              try {
+            try {
+              if (event === "token") {
                 const { text } = JSON.parse(data) as { text: string };
                 send({ type: "token", text });
-              } catch { /* skip malformed */ }
-            } else if (event === "error") {
-              try {
+              } else if (event === "tool_call") {
+                const { id, name, arguments: args } = JSON.parse(data) as {
+                  id: string; name: string; arguments: unknown;
+                };
+                send({ type: "tool_call", id, name, arguments: args });
+              } else if (event === "tool_result") {
+                const { id, name, result: r, error } = JSON.parse(data) as {
+                  id: string; name: string; result?: unknown; error?: unknown;
+                };
+                send({ type: "tool_result", id, name, result: r, error });
+              } else if (event === "notify") {
+                const { message, kind, payload } = JSON.parse(data) as {
+                  message: string; kind?: string; payload?: unknown;
+                };
+                send({ type: "notify", message, kind, payload });
+              } else if (event === "error") {
                 const { message } = JSON.parse(data) as { message: string };
                 send({ type: "error", message });
-              } catch {
-                send({ type: "error", message: data });
+              } else if (event === "done") {
+                send({ type: "done" });
               }
-            } else if (event === "done") {
-              send({ type: "done" });
+            } catch (e) {
+              app.log.warn({ e, event, data }, "malformed sse chunk");
             }
             result = gen.next();
           }

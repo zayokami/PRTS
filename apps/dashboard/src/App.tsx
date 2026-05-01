@@ -1,18 +1,28 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
-type Role = "user" | "assistant";
+type Role = "user" | "assistant" | "system";
 interface Msg {
   role: Role;
   content: string;
+  kind?: "text" | "tool" | "notify";
 }
 
 type Frame =
   | { type: "ready"; session_id: string }
   | { type: "token"; text: string }
+  | { type: "tool_call"; id: string; name: string; arguments: unknown }
+  | { type: "tool_result"; id: string; name: string; result?: unknown; error?: unknown }
+  | { type: "notify"; message: string; kind?: string; payload?: unknown }
   | { type: "done" }
   | { type: "error"; message: string };
 
 const SESSION_KEY = "prts.session_id";
+
+function summarize(value: unknown, max = 240): string {
+  if (value === undefined || value === null) return "";
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return text.length > max ? text.slice(0, max) + "…" : text;
+}
 
 export default function App() {
   const [messages, setMessages] = useState<Msg[]>([]);
@@ -37,12 +47,11 @@ export default function App() {
         const sid = frame.session_id;
         setSessionId(sid);
         localStorage.setItem(SESSION_KEY, sid);
-        // seed UI from server-side history
         fetch(`/api/sessions/${encodeURIComponent(sid)}/history`)
           .then((r) => (r.ok ? r.json() : { messages: [] }))
           .then((j: { messages: { role: Role; content: string }[] }) => {
             const seed = (j.messages ?? []).filter((m) => m.role === "user" || m.role === "assistant");
-            setMessages(seed.map((m) => ({ role: m.role, content: m.content })));
+            setMessages(seed.map((m) => ({ role: m.role, content: m.content, kind: "text" })));
             setStatus("ready");
           })
           .catch(() => setStatus("ready"));
@@ -50,17 +59,42 @@ export default function App() {
         setMessages((prev) => {
           const next = [...prev];
           const last = next[next.length - 1];
-          if (last && last.role === "assistant") {
+          if (last && last.role === "assistant" && last.kind === "text") {
             next[next.length - 1] = { ...last, content: last.content + frame.text };
           } else {
-            next.push({ role: "assistant", content: frame.text });
+            next.push({ role: "assistant", content: frame.text, kind: "text" });
           }
           return next;
         });
+      } else if (frame.type === "tool_call") {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "system",
+            kind: "tool",
+            content: `→ 调用 ${frame.name}(${summarize(frame.arguments, 160)})`,
+          },
+        ]);
+      } else if (frame.type === "tool_result") {
+        const isErr = frame.error !== undefined && frame.error !== null;
+        const label = isErr ? `✗ ${frame.name} 失败` : `← ${frame.name} 返回`;
+        const body = summarize(isErr ? frame.error : frame.result, 320);
+        setMessages((prev) => [
+          ...prev,
+          { role: "system", kind: "tool", content: `${label}: ${body}` },
+        ]);
+      } else if (frame.type === "notify") {
+        setMessages((prev) => [
+          ...prev,
+          { role: "system", kind: "notify", content: `🔔 ${frame.message}` },
+        ]);
       } else if (frame.type === "done") {
         setStatus("ready");
       } else if (frame.type === "error") {
-        setMessages((prev) => [...prev, { role: "assistant", content: `[error] ${frame.message}` }]);
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: `[error] ${frame.message}`, kind: "text" },
+        ]);
         setStatus("ready");
       }
     };
@@ -82,7 +116,7 @@ export default function App() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
     ws.send(JSON.stringify({ type: "user", content: text }));
-    setMessages((prev) => [...prev, { role: "user", content: text }]);
+    setMessages((prev) => [...prev, { role: "user", content: text, kind: "text" }]);
     setInput("");
     setStatus("streaming");
   };
@@ -106,12 +140,32 @@ export default function App() {
 
       <div ref={listRef} style={S.list}>
         {messages.length === 0 && <div style={S.hint}>博士,有什么需要协助的?</div>}
-        {messages.map((m, i) => (
-          <div key={i} style={{ ...S.row, ...(m.role === "user" ? S.rowUser : S.rowAssistant) }}>
-            <span style={S.role}>{m.role === "user" ? "博士" : "PRTS"}</span>
-            <pre style={S.content}>{m.content}</pre>
-          </div>
-        ))}
+        {messages.map((m, i) => {
+          const rowStyle =
+            m.role === "user"
+              ? { ...S.row, ...S.rowUser }
+              : m.role === "system"
+              ? { ...S.row, ...S.rowSystem }
+              : { ...S.row, ...S.rowAssistant };
+          const label =
+            m.role === "user"
+              ? "博士"
+              : m.role === "system"
+              ? m.kind === "notify"
+                ? "通知"
+                : "工具"
+              : "PRTS";
+          const contentStyle =
+            m.role === "system"
+              ? { ...S.content, ...S.contentSystem }
+              : S.content;
+          return (
+            <div key={i} style={rowStyle}>
+              <span style={S.role}>{label}</span>
+              <pre style={contentStyle}>{m.content}</pre>
+            </div>
+          );
+        })}
       </div>
 
       <form onSubmit={send} style={S.form}>
@@ -142,8 +196,10 @@ const S: Record<string, React.CSSProperties> = {
   row: { display: "flex", flexDirection: "column", gap: 4, maxWidth: "80ch" },
   rowUser: { alignSelf: "flex-end", alignItems: "flex-end" },
   rowAssistant: { alignSelf: "flex-start" },
+  rowSystem: { alignSelf: "center", alignItems: "center", opacity: 0.7, maxWidth: "70ch" },
   role: { fontSize: 11, opacity: 0.5 },
   content: { margin: 0, padding: "8px 12px", background: "#161b22", border: "1px solid #30363d", borderRadius: 6, whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "inherit", fontSize: 14 },
+  contentSystem: { background: "#10171f", borderColor: "#1f2a36", fontSize: 12, color: "#9aa7b3" },
   form: { display: "flex", gap: 8, padding: "12px 20px", borderTop: "1px solid #30363d" },
   input: { flex: 1, padding: "8px 12px", background: "#161b22", color: "inherit", border: "1px solid #30363d", borderRadius: 6, fontFamily: "inherit", fontSize: 14 },
   btn: { padding: "8px 16px", background: "#238636", color: "white", border: 0, borderRadius: 6, cursor: "pointer", fontFamily: "inherit" },

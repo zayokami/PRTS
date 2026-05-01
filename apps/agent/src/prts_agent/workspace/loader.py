@@ -37,6 +37,9 @@ def resolve_workspace_dir() -> Path:
     if seed.exists():
         for src in seed.rglob("*"):
             rel = src.relative_to(seed)
+            # 跳过 Python 缓存:这些是 import 时附带产生的,不应进 workspace。
+            if any(part in ("__pycache__",) or part.endswith(".pyc") for part in rel.parts):
+                continue
             dst = target / rel
             if src.is_dir():
                 dst.mkdir(parents=True, exist_ok=True)

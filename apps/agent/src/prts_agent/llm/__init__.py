@@ -1,8 +1,8 @@
 """LLM 客户端工厂。
 
-通过 LLM_PROVIDER 环境变量切换:
-- openai (默认): 走 AsyncOpenAI(base_url=...),兼容 OpenAI/DeepSeek/Ollama/Anthropic-compat
-- anthropic: 走 native anthropic SDK,保留 prompt caching / extended thinking
+通过 ``LLM_PROVIDER`` 环境变量切换:
+- ``openai`` (默认): 走 ``AsyncOpenAI(base_url=...)``,兼容 OpenAI/DeepSeek/Ollama/Anthropic-compat
+- ``anthropic``: 走 native ``anthropic`` SDK,保留 prompt caching / strict tool schema
 """
 
 from __future__ import annotations
@@ -10,7 +10,14 @@ from __future__ import annotations
 import os
 
 from .anthropic_client import AnthropicLlmClient
-from .base import ChatMessage, LlmClient
+from .base import (
+    ChatMessage,
+    EndEvent,
+    LlmClient,
+    StreamEvent,
+    TextEvent,
+    ToolCallEvent,
+)
 from .openai_client import OpenAILlmClient
 
 
@@ -28,4 +35,12 @@ def build_llm_client() -> LlmClient:
     )
 
 
-__all__ = ["ChatMessage", "LlmClient", "build_llm_client"]
+__all__ = [
+    "ChatMessage",
+    "EndEvent",
+    "LlmClient",
+    "StreamEvent",
+    "TextEvent",
+    "ToolCallEvent",
+    "build_llm_client",
+]
