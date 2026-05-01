@@ -43,11 +43,25 @@ def unbind_notify_queue(token: Token[asyncio.Queue[dict[str, Any]] | None]) -> N
 
 
 def _safe_workspace_path(workspace_dir: Path, rel: str) -> Path:
-    """阻止 ``..`` 越界 / 绝对路径访问 workspace 之外的位置。"""
-    target = (workspace_dir / rel).resolve()
+    """阻止 ``..`` 越界 / 绝对路径访问 workspace 之外的位置。
+
+    用 ``Path.relative_to`` 做归属判断:它在 Windows 上是大小写不敏感的、在
+    POSIX 上是大小写敏感的,符合各自文件系统语义。如果 rel 解析后跑出
+    workspace 树外,relative_to 抛 ValueError,翻成 PermissionError。
+    """
+    if not rel:
+        raise PermissionError("path 不能为空")
+    # 先拒绝绝对路径 —— Path("/foo") / "/etc/passwd" 在 POSIX 会丢掉左半边,
+    # 直接用绝对 rel 拼出去就绕过了 workspace_dir 的限制。
+    if Path(rel).is_absolute() or rel.startswith(("/", "\\")):
+        raise PermissionError(f"绝对路径被拒: {rel}")
+
     workspace_resolved = workspace_dir.resolve()
-    if workspace_resolved not in target.parents and target != workspace_resolved:
-        raise PermissionError(f"path 越界: {rel}")
+    target = (workspace_dir / rel).resolve()
+    try:
+        target.relative_to(workspace_resolved)
+    except ValueError as exc:
+        raise PermissionError(f"path 越界 (相对于 {workspace_resolved}): {rel}") from exc
     return target
 
 
@@ -102,6 +116,11 @@ class AgentRuntimeBridge:
         for p in base.rglob("*"):
             if not p.is_file():
                 continue
+            rel_parts = p.relative_to(base).parts
+            # 跳过 Python 缓存:这些是 import skill 时附带产生的,不属于
+            # workspace 内容。同样跳过任意以 _ 开头的目录(_examples/ 等)。
+            if any(part == "__pycache__" or part.endswith(".pyc") for part in rel_parts):
+                continue
             rel = p.relative_to(base).as_posix()
             if rel.startswith(prefix):
                 out.append(rel)
@@ -111,7 +130,13 @@ class AgentRuntimeBridge:
         if not session_id:
             from prts.context import current as _current_ctx
 
-            session_id = _current_ctx().session_id
+            try:
+                session_id = _current_ctx().session_id
+            except RuntimeError as exc:
+                # 没有活跃 PRTS context 时直接给空列表,而不是把 RuntimeError
+                # 冒泡到用户脚本 —— 用户脚本调 prts.memory.history() 拿空就好。
+                logger.warning("history() called without context: %s", exc)
+                return []
         rows = await self._store.history(session_id, limit=limit)
         return [
             {

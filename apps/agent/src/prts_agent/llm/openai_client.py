@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -87,7 +88,7 @@ class OpenAILlmClient(LlmClient):
             except json.JSONDecodeError:
                 logger.warning("malformed tool args from LLM: %r", args_text)
                 args_obj = {"_raw": args_text}
-            call_id = slot["id"] or f"call_{idx}"
+            call_id = slot["id"] or f"call_auto_{uuid.uuid4().hex[:12]}"
             name = slot["name"] or ""
             tool_calls_out.append({"id": call_id, "name": name, "arguments": args_obj})
             yield ToolCallEvent(type="tool_call", id=call_id, name=name, arguments=args_obj)

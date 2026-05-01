@@ -33,8 +33,19 @@ class ToolRegistry:
         self._tools: dict[str, ToolDefinition] = {}
 
     def register(self, tool: ToolDefinition) -> None:
-        if tool.name in self._tools:
-            logger.warning("tool %s already registered, overwriting", tool.name)
+        existing = self._tools.get(tool.name)
+        if existing is not None:
+            # 同名 skill 直接覆盖会让用户的"另一个文件里 @skill('foo')"静默丢失。
+            # 已存在的 source 都是 "skill" 时给出明确警告 + 文件 hint;后期 P4 接 mcp 时
+            # source 不同(比如 mcp 同名工具)再考虑命名空间隔离策略。
+            logger.warning(
+                "tool name conflict: %r already registered (source=%s),"
+                " new registration (source=%s) will OVERWRITE the previous one. "
+                "Rename one of the @skill / @task to avoid silent loss.",
+                tool.name,
+                existing.source,
+                tool.source,
+            )
         self._tools[tool.name] = tool
 
     def get(self, name: str) -> ToolDefinition | None:

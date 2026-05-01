@@ -8,10 +8,13 @@
    - tool_call:暂存,等本轮 stream 结束后统一调度
 4. 本轮结束后:
    - 没工具调用 → 把 assistant 文本写库,发 ``done``,退出
-   - 有工具调用 → 写 assistant(text + tool_calls 元数据);
-     依次 invoke,每个结果以 ``tool`` role 写库 + 通过 ``tool_result`` 事件
-     发出去;然后 goto 1(重新拉 history)
-5. 上限 ``MAX_ITERATIONS`` 防止 LLM 死循环互调工具
+   - 有工具调用 → 顺序 invoke,**最后一个事务里** 把 assistant 行(含
+     tool_calls 元数据) + 全部 tool 行一起写下去。途中 yield tool_call /
+     tool_result 事件以维持 UI 实时感,即便 crash 也只丢内存中的本轮内容,
+     不会留下"assistant 写了但 tool_result 缺失"的半成品 history。
+   - 然后 goto 1(重新拉 history)
+5. 上限 ``MAX_ITERATIONS`` 防止 LLM 死循环互调工具;触底时写一行
+   "stopped due to limit" 的 assistant 消息收尾,避免下次还看到悬挂 tool_calls
 
 skill 内部 ``client.notify(...)`` 走 ``runtime.push_notify`` → contextvar 队列,
 我们在每条工具结果之后把队列里的事件 flush 到 SSE。
@@ -37,7 +40,8 @@ from ..llm import (
     ToolCallEvent,
 )
 from ..llm.anthropic_client import AnthropicLlmClient
-from ..memory import SqliteStore, StoredMessage
+from ..memory import SqliteStore
+from ..memory.sqlite import PendingMessage
 from ..runtime import bind_notify_queue, unbind_notify_queue
 from ..tools import ToolRegistry
 
@@ -46,7 +50,7 @@ logger = logging.getLogger(__name__)
 MAX_ITERATIONS = 8
 
 
-def _stored_to_chat(messages: list[StoredMessage]) -> list[ChatMessage]:
+def _stored_to_chat(messages: list) -> list[ChatMessage]:
     """SQLite ``StoredMessage`` → LLM ``ChatMessage``(OpenAI 风格)。"""
     out: list[ChatMessage] = []
     for m in messages:
@@ -142,13 +146,7 @@ class AgentLoop:
 
                 tool_defs = self._tools.all()
                 openai_tools = self._tools.to_openai_tools() if tool_defs else None
-                # OpenAILlmClient 接 OpenAI 风格;Anthropic 客户端会在内部转成 tool_use。
-                # 两边都拿 OpenAI 风格 tools,Anthropic 客户端忽略 type/function 包装,
-                # 但 schema 主体一致。简单起见这里给 OpenAI 风格,Anthropic 客户端
-                # 自己重新打包:
                 anthropic_tools = self._tools.to_anthropic_tools() if tool_defs else None
-
-                # 选哪一种取决于 client 类型;一个粗暴但可读的判断:
                 tools_arg = (
                     anthropic_tools
                     if isinstance(self._llm, AnthropicLlmClient)
@@ -158,39 +156,61 @@ class AgentLoop:
                 pending_calls: list[dict[str, Any]] = []
                 assistant_text_acc: list[str] = []
                 end_evt: EndEvent | None = None
+                stream_failed: BaseException | None = None
 
-                async for evt in self._llm.stream_chat(messages, tools=tools_arg):
-                    if isinstance(evt, TextEvent):
-                        assistant_text_acc.append(evt.delta)
-                        yield {"event": "token", "data": {"text": evt.delta}}
-                        async for ne in self._drain_notify(notify_queue):
-                            yield ne
-                    elif isinstance(evt, ToolCallEvent):
-                        pending_calls.append(
-                            {"id": evt.id, "name": evt.name, "arguments": evt.arguments}
-                        )
-                    elif isinstance(evt, EndEvent):
-                        end_evt = evt
+                try:
+                    async for evt in self._llm.stream_chat(messages, tools=tools_arg):
+                        if isinstance(evt, TextEvent):
+                            assistant_text_acc.append(evt.delta)
+                            yield {"event": "token", "data": {"text": evt.delta}}
+                            async for ne in self._drain_notify(notify_queue):
+                                yield ne
+                        elif isinstance(evt, ToolCallEvent):
+                            pending_calls.append(
+                                {"id": evt.id, "name": evt.name, "arguments": evt.arguments}
+                            )
+                        elif isinstance(evt, EndEvent):
+                            end_evt = evt
+                except BaseException as exc:  # noqa: BLE001
+                    # LLM 流半路异常:把已经收到的文本 / tool_calls 落库,然后冒泡。
+                    # 不写库的话,前端拿到的 token 已经渲染但 history 没有这条 assistant,
+                    # 下一轮会出现"用户视角看到了 PRTS 说话但 LLM 视角没说过"的悖论。
+                    logger.exception("stream_chat failed mid-stream")
+                    stream_failed = exc
 
                 # 一轮 LLM 流结束。先把队列里残留的 notify 全部 flush 出去。
                 async for ne in self._drain_notify(notify_queue):
                     yield ne
 
                 assistant_text = "".join(assistant_text_acc)
-                meta: dict[str, Any] | None = None
-                if pending_calls:
-                    meta = {"tool_calls": pending_calls}
-                # 即便没文字也要写一行(保留 tool_calls 元信息),否则下一轮组 messages 时
-                # 会缺失 tool_call 上下文。
-                if assistant_text or pending_calls:
-                    await self._store.append_message(
-                        session_id, "assistant", assistant_text, meta=meta
-                    )
 
+                # ---- 没工具调用:写完 assistant 直接结束本次 converse ----
                 if not pending_calls:
-                    yield {"event": "done", "data": {"session_id": session_id}}
+                    if assistant_text:
+                        await self._store.append_message(
+                            session_id, "assistant", assistant_text
+                        )
+                    if stream_failed is not None:
+                        yield {
+                            "event": "error",
+                            "data": {
+                                "message": str(stream_failed),
+                                "type": type(stream_failed).__name__,
+                            },
+                        }
+                        return
+                    # finish_reason=length 也算 done:LLM 因为 max_tokens 截断,
+                    # 把已经吐出的内容当成最终答复;由前端决定是否提示用户重试。
+                    stop_reason = end_evt.stop_reason if end_evt else "stop"
+                    yield {
+                        "event": "done",
+                        "data": {"session_id": session_id, "stop_reason": stop_reason},
+                    }
                     return
 
+                # ---- 有工具调用:发事件 → invoke → 收结果 ----
+                # 先 yield 所有 tool_call 事件让 UI 立刻看到;之后顺序执行,
+                # 每个 tool_result 事件都立刻 yield 出去,保留交互实时性。
                 for call in pending_calls:
                     yield {
                         "event": "tool_call",
@@ -200,6 +220,9 @@ class AgentLoop:
                             "arguments": call["arguments"],
                         },
                     }
+
+                tool_outcomes: list[tuple[dict[str, Any], Any, bool]] = []
+                for call in pending_calls:
                     is_error = False
                     try:
                         result = await self._tools.invoke(call["name"], call["arguments"])
@@ -208,17 +231,7 @@ class AgentLoop:
                         result = {"error": str(exc), "type": type(exc).__name__}
                         is_error = True
 
-                    result_text = _serialize_tool_result(result)
-                    await self._store.append_message(
-                        session_id,
-                        "tool",
-                        result_text,
-                        meta={
-                            "tool_call_id": call["id"],
-                            "tool_name": call["name"],
-                            "is_error": is_error,
-                        },
-                    )
+                    tool_outcomes.append((call, result, is_error))
                     yield {
                         "event": "tool_result",
                         "data": {
@@ -231,10 +244,49 @@ class AgentLoop:
                     async for ne in self._drain_notify(notify_queue):
                         yield ne
 
+                # ---- 一次事务把 assistant + 所有 tool 行写下去 ----
+                # 这样要么本轮的 (assistant + 全部 tool_results) 整体在 history 里,
+                # 要么完全不在,绝不会出现 assistant 有 tool_calls 而 tool_result 缺失。
+                batch: list[PendingMessage] = [
+                    PendingMessage(
+                        role="assistant",
+                        content=assistant_text,
+                        meta={"tool_calls": pending_calls},
+                    )
+                ]
+                for call, result, is_error in tool_outcomes:
+                    batch.append(
+                        PendingMessage(
+                            role="tool",
+                            content=_serialize_tool_result(result),
+                            meta={
+                                "tool_call_id": call["id"],
+                                "tool_name": call["name"],
+                                "is_error": is_error,
+                            },
+                        )
+                    )
+                await self._store.append_messages(session_id, batch)
+
+                if stream_failed is not None:
+                    yield {
+                        "event": "error",
+                        "data": {
+                            "message": str(stream_failed),
+                            "type": type(stream_failed).__name__,
+                        },
+                    }
+                    return
+
                 if end_evt is None:
                     logger.warning("LLM stream ended without EndEvent")
 
-            # 触底:工具循环过深
+            # 触底:工具循环过深。补一行 assistant 收尾,避免悬挂 tool_calls。
+            await self._store.append_message(
+                session_id,
+                "assistant",
+                f"(已达到工具循环上限 {MAX_ITERATIONS} 次,放弃后续调用。)",
+            )
             yield {
                 "event": "error",
                 "data": {"message": f"agent loop exceeded {MAX_ITERATIONS} iterations"},

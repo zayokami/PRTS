@@ -32,6 +32,25 @@ def _convert_messages(
     system_chunks: list[str] = []
     converted: list[dict[str, Any]] = []
 
+    def _last_tool_result_user() -> dict[str, Any] | None:
+        """如果上一条 converted 是承载 tool_result 的 user 消息,返回它。
+
+        Anthropic 要求"一次 assistant.tool_use 多块"对应"紧跟一条 user 消息,
+        content 里塞所有 tool_result"。我们的输入是 OpenAI 风格,每个 tool 各
+        是一条独立的 tool 消息 —— 必须在转换时合并。
+        """
+        if not converted:
+            return None
+        last = converted[-1]
+        if last.get("role") != "user":
+            return None
+        content = last.get("content")
+        if not isinstance(content, list) or not content:
+            return None
+        if all(blk.get("type") == "tool_result" for blk in content):
+            return last
+        return None
+
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content", "")
@@ -75,18 +94,17 @@ def _convert_messages(
             continue
 
         if role == "tool":
-            converted.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": msg.get("tool_call_id", ""),
-                            "content": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
-                        }
-                    ],
-                }
-            )
+            block = {
+                "type": "tool_result",
+                "tool_use_id": msg.get("tool_call_id", ""),
+                "content": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
+            }
+            # 上一条已经是 tool_result-only 的 user → 把这块塞进去,合并多个 tool_result。
+            existing = _last_tool_result_user()
+            if existing is not None:
+                existing["content"].append(block)
+            else:
+                converted.append({"role": "user", "content": [block]})
             continue
 
         logger.warning("unknown role %r in messages, skipping", role)

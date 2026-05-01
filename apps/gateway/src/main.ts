@@ -39,7 +39,7 @@ type OutboundFrame =
   | { type: "tool_call"; id: string; name: string; arguments: unknown }
   | { type: "tool_result"; id: string; name: string; result?: unknown; error?: unknown }
   | { type: "notify"; message: string; kind?: string; payload?: unknown }
-  | { type: "done" }
+  | { type: "done"; stop_reason?: string }
   | { type: "error"; message: string };
 
 /** 解析 SSE: `event: x\ndata: {...}\n\n` —— 上游 sse-starlette 用 CRLF,调用方需先规范化。 */
@@ -61,6 +61,9 @@ function* parseSseChunks(buffer: string): Generator<{ event: string; data: strin
   return buffer.slice(cursor);
 }
 
+// 4 MiB:把单条 user 消息打到这里基本就是恶意了,SSE 上游也会被这种行为拖住。
+const MAX_USER_CONTENT_BYTES = 4 * 1024 * 1024;
+
 app.get<{ Querystring: { session_id?: string } }>(
   "/ws/chat",
   { websocket: true },
@@ -69,16 +72,32 @@ app.get<{ Querystring: { session_id?: string } }>(
     const activeSessionId =
       requested && /^[\w-]{1,64}$/.test(requested) ? requested : randomUUID();
     let busy = false;
+    // WS 关闭时把进行中的 agent fetch 一并中断 —— 否则 agent 会继续算下去,
+    // 浪费 LLM token 也吃 SQLite 写盘。
+    let inflight: AbortController | null = null;
 
     const send = (frame: OutboundFrame) => {
+      if (socket.readyState !== socket.OPEN) return;
       try { socket.send(JSON.stringify(frame)); } catch (e) { app.log.warn({ e }, "ws send failed"); }
     };
 
     send({ type: "ready", session_id: activeSessionId });
 
+    socket.on("close", () => {
+      if (inflight) {
+        try { inflight.abort(); } catch { /* ignore */ }
+        inflight = null;
+      }
+    });
+
     socket.on("message", async (raw: Buffer) => {
       if (busy) {
         send({ type: "error", message: "上一轮还在生成中,请等待" });
+        return;
+      }
+
+      if (raw.byteLength > MAX_USER_CONTENT_BYTES) {
+        send({ type: "error", message: `消息过大 (${raw.byteLength} bytes > ${MAX_USER_CONTENT_BYTES})` });
         return;
       }
 
@@ -95,6 +114,9 @@ app.get<{ Querystring: { session_id?: string } }>(
       }
 
       busy = true;
+      let sawDone = false;
+      const ac = new AbortController();
+      inflight = ac;
 
       try {
         const resp = await fetch(`${AGENT_URL}/agent/v1/converse`, {
@@ -105,12 +127,12 @@ app.get<{ Querystring: { session_id?: string } }>(
             content: frame.content,
             channel: "web",
           }),
+          signal: ac.signal,
         });
 
         if (!resp.ok || !resp.body) {
           const text = await resp.text().catch(() => "");
           send({ type: "error", message: `agent ${resp.status}: ${text.slice(0, 200)}` });
-          busy = false;
           return;
         }
 
@@ -149,19 +171,41 @@ app.get<{ Querystring: { session_id?: string } }>(
                 const { message } = JSON.parse(data) as { message: string };
                 send({ type: "error", message });
               } else if (event === "done") {
-                send({ type: "done" });
+                let stop_reason: string | undefined;
+                try {
+                  stop_reason = (JSON.parse(data) as { stop_reason?: string }).stop_reason;
+                } catch { /* keep undefined */ }
+                send({ type: "done", stop_reason });
+                sawDone = true;
               }
             } catch (e) {
               app.log.warn({ e, event, data }, "malformed sse chunk");
+              // 上游帧损坏也告诉前端,不要让 UI 留在 streaming 转圈状态。
+              send({
+                type: "error",
+                message: `上游 SSE 帧解析失败 (event=${event})`,
+              });
             }
             result = gen.next();
           }
           buffer = result.value as string;
         }
+
+        // 上游流自然结束但没发 done(网关被踢、agent 提前 close 等) ——
+        // 给前端一个兜底 done,让 UI 能从 streaming 退出去。
+        if (!sawDone) {
+          send({ type: "done", stop_reason: "stream_closed" });
+        }
       } catch (err) {
+        if ((err as { name?: string }).name === "AbortError") {
+          app.log.info({ session: activeSessionId }, "fetch aborted (client disconnected)");
+          return;
+        }
         app.log.error({ err }, "agent bridge failed");
         send({ type: "error", message: err instanceof Error ? err.message : String(err) });
+        if (!sawDone) send({ type: "done", stop_reason: "error" });
       } finally {
+        if (inflight === ac) inflight = null;
         busy = false;
       }
     });

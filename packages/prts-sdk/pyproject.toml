@@ -5,9 +5,10 @@ description = "PRTS SDK — 用户在 workspace/skills/*.py 里 from prts import
 requires-python = ">=3.12"
 authors = [{ name = "zayoka" }]
 license = { text = "MIT" }
-dependencies = [
-    "fastmcp>=3.0",
-]
+# 故意保持 zero deps:prts-sdk 的所有"对外动作"都通过 prts.runtime.RuntimeBridge
+# 走到 Agent,SDK 自己不需要任何第三方包。这样脚本环境最干净,IDE 类型也不会
+# 被 LLM 客户端等大依赖拖慢。
+dependencies = []
 
 [build-system]
 requires = ["hatchling"]

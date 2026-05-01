@@ -5,6 +5,8 @@
 2. 对 ``workspace/skills/`` 下每个非下划线 ``.py``:
    - 用 importlib 在 ``prts.user_skills.<stem>`` 命名空间下加载
    - 每个文件单独 try/except,失败的文件不影响其他文件
+   - 失败的文件 **回滚** 它已经注册到 registry 的 @skill / @task,
+     否则会留下半个文件的工具暴露给 LLM
 3. ``prts.skill.registered_skills()`` 拿到全部 SkillRegistration
 4. 包成 ToolDefinition 注册到 ``ToolRegistry``
 
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import re
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -30,6 +33,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 USER_PKG_PREFIX = "prts_user_skills"
+_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9_]")
 
 
 @dataclass
@@ -69,10 +73,33 @@ def _purge_user_modules() -> None:
             del sys.modules[mod_name]
 
 
+def _module_name_for(rel: Path) -> str:
+    """把相对路径转成合法的 Python 模块名。
+
+    ``weather-info.py`` → ``prts_user_skills.weather_info`` 之类。非标识符字符
+    全部替换成 ``_``;数字开头补 ``_``;空段补 ``_`` 兜底。
+    """
+    parts: list[str] = []
+    for raw in rel.with_suffix("").parts:
+        safe = _NAME_SAFE_RE.sub("_", raw)
+        if not safe:
+            safe = "_"
+        if safe[0].isdigit():
+            safe = "_" + safe
+        parts.append(safe)
+    return USER_PKG_PREFIX + "." + ".".join(parts)
+
+
 def load_user_skills(workspace_dir: Path, registry: "ToolRegistry") -> LoadedSkills:
     """扫描并加载用户脚本,把 @skill 注册进 ``registry``。"""
     # 局部 import 避免静态环依赖(skill 模块同时被 sdk 和 agent 引用)
-    from prts.skill import _reset_for_tests, registered_skills, registered_tasks
+    from prts.skill import (
+        _reset_for_tests,
+        _restore,
+        _snapshot,
+        registered_skills,
+        registered_tasks,
+    )
 
     from ..tools import ToolDefinition, make_skill_invoker
 
@@ -85,8 +112,9 @@ def load_user_skills(workspace_dir: Path, registry: "ToolRegistry") -> LoadedSki
     result = LoadedSkills(files_scanned=len(files))
 
     for path in files:
-        rel = path.relative_to(skills_dir).with_suffix("")
-        mod_name = USER_PKG_PREFIX + "." + ".".join(rel.parts)
+        rel = path.relative_to(skills_dir)
+        mod_name = _module_name_for(rel)
+        snap = _snapshot()
         try:
             spec = importlib.util.spec_from_file_location(mod_name, path)
             if spec is None or spec.loader is None:
@@ -96,6 +124,8 @@ def load_user_skills(workspace_dir: Path, registry: "ToolRegistry") -> LoadedSki
             spec.loader.exec_module(module)
         except Exception as exc:  # noqa: BLE001
             sys.modules.pop(mod_name, None)
+            # 回滚这个文件已经注册的 @skill / @task —— 不能让半个文件暴露给 LLM。
+            _restore(snap)
             tb = traceback.format_exc()
             logger.warning("skill 加载失败 %s: %s", path, exc)
             result.errors.append(

@@ -70,6 +70,18 @@ def _loop(req: Request) -> AgentLoop:
     return req.app.state.agent_loop  # type: ignore[no-any-return]
 
 
+def _sse_safe_dumps(data: Any) -> str:
+    """SSE 帧 data 的安全序列化。
+
+    - ``ensure_ascii=False``:中文按字面输出,不让 \\uXXXX 占满帧
+    - ``default=str``:工具结果可能含 datetime 之类非 JSON 原生类型,先兜底转字符串
+    - U+2028 / U+2029:被 ECMA-404 当作合法 JSON 字符,但 ECMA-262 之前把它们当
+      行终止符,某些老旧 SSE 中间件 / 浏览器会把帧从中切断 —— 显式转义
+    """
+    text = json.dumps(data, ensure_ascii=False, default=str)
+    return text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+
+
 @router.post("/converse")
 async def converse(req: ConverseRequest, request: Request) -> EventSourceResponse:
     workspace_dir = request.app.state.workspace_dir
@@ -85,12 +97,21 @@ async def converse(req: ConverseRequest, request: Request) -> EventSourceRespons
                 channel=req.channel,
                 user_ref=req.user_ref,
             ):
-                yield {"event": evt["event"], "data": json.dumps(evt["data"], ensure_ascii=False)}
+                # 客户端断开时停止生成,放掉 LLM 网络 + DB 写盘成本
+                if await request.is_disconnected():
+                    logger.info(
+                        "client disconnected, aborting converse for session=%s",
+                        req.session_id,
+                    )
+                    break
+                yield {"event": evt["event"], "data": _sse_safe_dumps(evt["data"])}
         except Exception as exc:  # noqa: BLE001
             logger.exception("converse loop failed")
             yield {
                 "event": "error",
-                "data": json.dumps({"message": str(exc), "type": type(exc).__name__}),
+                "data": _sse_safe_dumps(
+                    {"message": str(exc), "type": type(exc).__name__}
+                ),
             }
 
     return EventSourceResponse(event_stream())

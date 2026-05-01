@@ -13,7 +13,7 @@ type Frame =
   | { type: "tool_call"; id: string; name: string; arguments: unknown }
   | { type: "tool_result"; id: string; name: string; result?: unknown; error?: unknown }
   | { type: "notify"; message: string; kind?: string; payload?: unknown }
-  | { type: "done" }
+  | { type: "done"; stop_reason?: string }
   | { type: "error"; message: string };
 
 const SESSION_KEY = "prts.session_id";
@@ -98,10 +98,21 @@ export default function App() {
         setStatus("ready");
       }
     };
-    ws.onclose = () => setStatus("closed");
-    ws.onerror = () => setStatus("closed");
+    // 只有"当前活跃的"那个 ws 关闭了才把 UI 置为 closed —— React 18
+    // StrictMode dev 下 useEffect 会跑两遍,第一遍的 ws 在 cleanup 里被
+    // close 之后还会触发 onclose,如果不判断 ref,会把第二次连接的 UI
+    // 状态错误压回 closed。
+    ws.onclose = () => {
+      if (wsRef.current === ws) setStatus("closed");
+    };
+    ws.onerror = () => {
+      if (wsRef.current === ws) setStatus("closed");
+    };
 
-    return () => ws.close();
+    return () => {
+      if (wsRef.current === ws) wsRef.current = null;
+      try { ws.close(); } catch { /* ignore */ }
+    };
   }, []);
 
   useEffect(() => {
