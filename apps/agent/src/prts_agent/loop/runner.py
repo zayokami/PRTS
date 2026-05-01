@@ -86,9 +86,41 @@ def _stored_to_chat(messages: list) -> list[ChatMessage]:
 
 
 def _serialize_tool_result(result: Any) -> str:
-    """工具结果统一转成字符串塞进 ``tool`` 消息的 content。"""
+    """工具结果统一转成字符串塞进 ``tool`` 消息的 content。
+
+    正常路径 invoker 已经把 MCP ``CallToolResult`` 拆开了,这里只剩 str / dict / list /
+    None 等普通值。但如果有人(单测、未来新接入的别的工具协议)直接把原始
+    ``CallToolResult`` 丢进来,``json.dumps`` 会忽略它的 ``content`` / ``structuredContent``
+    给一个空 ``{}``,LLM 就会拿到空字符串瞎猜。下面那段防御性分支兜底。
+    """
     if isinstance(result, str):
         return result
+    if hasattr(result, "isError") and hasattr(result, "content"):
+        if getattr(result, "isError", False):
+            parts = [
+                getattr(b, "text", "")
+                for b in (getattr(result, "content", []) or [])
+                if getattr(b, "type", None) == "text"
+            ]
+            return "ERROR: " + ("\n\n".join(p for p in parts if p) or "no error text")
+        structured = getattr(result, "structuredContent", None)
+        if isinstance(structured, dict) and list(structured.keys()) == ["result"]:
+            return _serialize_tool_result(structured["result"])
+        if structured is not None:
+            try:
+                return json.dumps(structured, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                return str(structured)
+        blocks = getattr(result, "content", []) or []
+        if len(blocks) == 1 and getattr(blocks[0], "type", None) == "text":
+            return getattr(blocks[0], "text", "")
+        rendered = []
+        for b in blocks:
+            if hasattr(b, "model_dump"):
+                rendered.append(b.model_dump(mode="json"))
+            else:
+                rendered.append({"type": getattr(b, "type", "unknown"), "repr": repr(b)})
+        return json.dumps(rendered, ensure_ascii=False, default=str)
     try:
         return json.dumps(result, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
