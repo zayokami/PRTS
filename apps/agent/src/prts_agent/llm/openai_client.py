@@ -24,6 +24,10 @@ class OpenAILlmClient(LlmClient):
         self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self._model = model
 
+    @property
+    def model(self) -> str:
+        return self._model
+
     async def stream_chat(
         self,
         messages: list[ChatMessage],

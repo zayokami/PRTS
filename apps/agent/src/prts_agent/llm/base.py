@@ -52,6 +52,24 @@ StreamEvent = Union[TextEvent, ToolCallEvent, EndEvent]
 
 
 class LlmClient(ABC):
+    """LLM 客户端抽象接口。
+
+    子类必须暴露 ``model`` (只读) 供上层做 token 预算管理。
+    """
+
+    @property
+    @abstractmethod
+    def model(self) -> str:
+        """当前使用的模型标识字符串,如 ``"gpt-4o-mini"`` 或 ``"claude-sonnet-4-6"`` 。"""
+        raise NotImplementedError
+
+    @property
+    def context_limit(self) -> int:
+        """该模型的上下文窗口大小 (tokens)。"""
+        from .tokenizer import get_context_limit
+
+        return get_context_limit(self.model)
+
     @abstractmethod
     def stream_chat(
         self,
