@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [tool.uv.workspace]
-members = ["apps/agent", "packages/prts-sdk"]
+members = ["apps/agent", "packages/prts-sdk", "mcp-servers/prts-workspace"]
 
 [tool.uv.sources]
 prts = { workspace = true }

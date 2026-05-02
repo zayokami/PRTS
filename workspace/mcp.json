@@ -18,6 +18,13 @@
         "1536"
       ],
       "disabled": true
+    },
+    "prts-workspace": {
+      "command": "prts-workspace",
+      "env": {
+        "PRTS_WORKSPACE_DIR": "${WORKSPACE_DIR}"
+      },
+      "disabled": true
     }
   }
 }

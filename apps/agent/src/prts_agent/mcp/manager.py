@@ -35,31 +35,56 @@ ServerStatus = Literal["disabled", "starting", "ready", "error", "stopped"]
 _WIN_CMD_WRAPPERS = {"npx", "npm", "yarn", "pnpm", "uvx", "bunx", "bun"}
 
 
-def _resolve_command(command: str) -> str:
-    """Windows 上把 ``npx`` 之类的 shim 名字补成 ``npx.cmd``。
+def _resolve_command(command: str) -> tuple[str | None, list[str]]:
+    """把 mcp.json 里的 ``command`` 解析成可 spawn 的可执行路径。
 
-    要点:Windows ``CreateProcess`` (asyncio 子进程的底层实现) 不像 cmd.exe
-    那样自动应用 PATHEXT,所以裸 "npx" 会 ``WinError 2``,即便 PATH 上能找到
-    ``npx.cmd``。``shutil.which`` 自身会找到 ``npx.cmd`` 全路径,但单返回值会
-    丢掉 ``.cmd`` 后缀信息;为了让 spawn 拿到一个能直接跑的字符串,这里:
+    返回 ``(resolved, tried)``。``resolved`` 是绝对路径或 None(找不到);
+    ``tried`` 是探测过的候选名单,用于在 manager 出错时给用户看。
 
-    - 命令在已知 wrapper 名单里 → 优先尝试 ``.cmd`` 形式(``which`` 找到则返回)。
-    - 否则用原名;``which`` 找到也直接返回原名(用户给的可能就是绝对路径或
-      已带后缀)。
-    其他平台原样返回。
+    解析顺序:
+
+    1. **Windows wrapper 名单**(``npx`` / ``uvx`` / ``pnpm`` 等):先试 ``.cmd``。
+       Windows ``CreateProcess`` 不像 cmd.exe 那样自动应用 PATHEXT,裸 ``npx`` 会
+       ``WinError 2``,必须显式带后缀。
+    2. ``shutil.which(command)``:覆盖 PATH 上的二进制 + 用户写绝对路径的 case。
+    3. **venv 兜底**:``.venv/Scripts/<cmd>{.exe,.cmd,.bat}``(Win)或
+       ``.venv/bin/<cmd>``(POSIX)。Agent 跑在 venv 里时,venv 里的 console
+       script(比如 ``prts-workspace``)在 PATH 里通常找不到,因为 venv 没被
+       activate;但 ``sys.prefix`` 一定指向当前 venv,可靠。
     """
-    if sys.platform != "win32":
-        return command
-    base = command.lower()
-    # 关键:wrapper 必须先看 .cmd —— ``which("npx")`` 找到的也是 ``npx.cmd``,
-    # 但只返回 ``command`` 会让 CreateProcess 拿不到能跑的可执行。
-    if base in _WIN_CMD_WRAPPERS:
-        candidate = command + ".cmd"
-        if shutil.which(candidate):
-            return candidate
-    if shutil.which(command):
-        return command
-    return command
+    tried: list[str] = []
+
+    if sys.platform == "win32":
+        base = command.lower()
+        if base in _WIN_CMD_WRAPPERS:
+            candidate = command + ".cmd"
+            tried.append(candidate)
+            found = shutil.which(candidate)
+            if found:
+                return found, tried
+        tried.append(command)
+        found = shutil.which(command)
+        if found:
+            # 返回完整路径(含 .exe/.cmd)才能让 CreateProcess 直接跑。
+            return found, tried
+        venv_scripts = Path(sys.prefix) / "Scripts"
+        for ext in (".exe", ".cmd", ".bat", ""):
+            cand = venv_scripts / f"{command}{ext}"
+            tried.append(str(cand))
+            if cand.is_file():
+                return str(cand), tried
+        return None, tried
+
+    # POSIX
+    tried.append(command)
+    found = shutil.which(command)
+    if found:
+        return found, tried
+    cand = Path(sys.prefix) / "bin" / command
+    tried.append(str(cand))
+    if cand.is_file():
+        return str(cand), tried
+    return None, tried
 
 
 @dataclass
@@ -164,7 +189,26 @@ class MCPManager:
             logger.error("MCP SDK missing — install mcp>=1.27 (server=%r)", name)
             return
 
-        resolved_command = _resolve_command(cfg.command)
+        resolved_command, tried = _resolve_command(cfg.command)
+        if resolved_command is None:
+            # spawn 之前先拦截:报"找不到命令"是 P4 启动失败最常见的原因,
+            # 直接把候选名单写进 error,用户不用 Ctrl-F 翻日志。
+            self._states[name] = MCPServerState(
+                name=name,
+                status="error",
+                error=(
+                    f"command {cfg.command!r} not found. "
+                    f"Tried: {tried}. "
+                    "Install the binary to PATH or use an absolute path in mcp.json."
+                ),
+                command=cfg.command,
+            )
+            logger.error(
+                "MCP server %r: command %r not found, tried %s",
+                name, cfg.command, tried,
+            )
+            return
+
         params = StdioServerParameters(
             command=resolved_command,
             args=list(cfg.args),

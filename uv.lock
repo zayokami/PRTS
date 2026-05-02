@@ -7,6 +7,7 @@ members = [
     "prts",
     "prts-agent",
     "prts-monorepo",
+    "prts-workspace-mcp",
 ]
 
 [[package]]
@@ -526,6 +527,17 @@ requires-dist = [
     { name = "prts", editable = "packages/prts-sdk" },
     { name = "prts-agent", editable = "apps/agent" },
 ]
+
+[[package]]
+name = "prts-workspace-mcp"
+version = "0.1.0"
+source = { editable = "mcp-servers/prts-workspace" }
+dependencies = [
+    { name = "mcp" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "mcp", specifier = ">=1.27" }]
 
 [[package]]
 name = "pycparser"
