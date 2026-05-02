@@ -25,6 +25,7 @@ import prts.runtime as prts_runtime
 
 from .api import router as agent_router
 from .llm import build_llm_client
+from .llm.embedding import build_embedding_client
 from .loop import AgentLoop
 from .mcp import MCPConfigError, MCPManager, load_mcp_config
 from .memory import SqliteStore, init_store
@@ -45,10 +46,15 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     await store.ensure_schema()
 
     llm_client = build_llm_client()
+    embedding_client = build_embedding_client()
     tools = ToolRegistry()
 
     bridge = AgentRuntimeBridge(
-        workspace_dir=workspace, store=store, tools=tools, llm_client=llm_client
+        workspace_dir=workspace,
+        store=store,
+        tools=tools,
+        llm_client=llm_client,
+        embedding_client=embedding_client,
     )
     prts_runtime.set_runtime(bridge)
 
@@ -71,7 +77,12 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 
         loaded = load_user_skills(workspace, tools)
 
-        agent_loop = AgentLoop(store=store, llm=llm_client, tools=tools)
+        agent_loop = AgentLoop(
+            store=store,
+            llm=llm_client,
+            tools=tools,
+            embedding_client=embedding_client,
+        )
 
         app.state.workspace_dir = workspace
         app.state.store = store

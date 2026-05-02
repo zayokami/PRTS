@@ -8,6 +8,16 @@
         "${WORKSPACE_DIR}"
       ],
       "disabled": true
+    },
+    "prts-vector": {
+      "command": "prts-vector",
+      "args": [
+        "--db",
+        "${WORKSPACE_DIR}/vector.db",
+        "--dim",
+        "1536"
+      ],
+      "disabled": true
     }
   }
 }

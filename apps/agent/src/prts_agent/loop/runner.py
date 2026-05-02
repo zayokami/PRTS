@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from typing import Any
 
 from prts.context import CallContext as PrtsCallContext
@@ -40,6 +41,7 @@ from ..llm import (
     ToolCallEvent,
 )
 from ..llm.anthropic_client import AnthropicLlmClient
+from ..llm.embedding import EmbeddingClient
 from ..memory import SqliteStore
 from ..memory.sqlite import PendingMessage
 from ..runtime import bind_notify_queue, unbind_notify_queue
@@ -139,10 +141,12 @@ class AgentLoop:
         store: SqliteStore,
         llm: LlmClient,
         tools: ToolRegistry,
+        embedding_client: EmbeddingClient | None = None,
     ) -> None:
         self._store = store
         self._llm = llm
         self._tools = tools
+        self._embedding = embedding_client
 
     async def converse(
         self,
@@ -247,6 +251,10 @@ class AgentLoop:
                     # finish_reason=length 也算 done:LLM 因为 max_tokens 截断,
                     # 把已经吐出的内容当成最终答复;由前端决定是否提示用户重试。
                     stop_reason = end_evt.stop_reason if end_evt else "stop"
+                    if assistant_text:
+                        await self._auto_remember(
+                            session_id, user_content, assistant_text, channel
+                        )
                     yield {
                         "event": "done",
                         "data": {"session_id": session_id, "stop_reason": stop_reason},
@@ -339,6 +347,36 @@ class AgentLoop:
         finally:
             unbind_notify_queue(nq_token)
             prts_reset(ctx_token)
+
+    async def _auto_remember(
+        self,
+        session_id: str,
+        user_content: str,
+        assistant_text: str,
+        channel: str,
+    ) -> None:
+        """把本轮对话向量化后写入向量存储。失败只打日志,不阻塞 SSE。"""
+        if self._embedding is None:
+            return
+        try:
+            text = f"[{channel}] User: {user_content}\nAssistant: {assistant_text}"
+            vec = await self._embedding.embed(text)
+            mem_id = f"{session_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+            await self._tools.invoke(
+                "prts-vector__upsert",
+                {
+                    "id": mem_id,
+                    "vector": vec,
+                    "payload": {
+                        "session_id": session_id,
+                        "channel": channel,
+                        "text": text,
+                    },
+                },
+            )
+            logger.debug("auto-remember %s ok", mem_id)
+        except Exception:
+            logger.exception("auto-remember failed")
 
     async def _drain_notify(
         self, queue: asyncio.Queue[dict[str, Any]]

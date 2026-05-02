@@ -45,6 +45,14 @@ class RuntimeBridge(Protocol):
     async def history(self, session_id: str | None, limit: int) -> list[dict[str, Any]]:
         ...
 
+    async def remember(self, text: str, payload: dict[str, Any] | None = None) -> None:
+        """把文本嵌入向量并写入向量存储。"""
+        ...
+
+    async def search_memory(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        """向量检索,返回 [{id, distance, payload}] 列表。"""
+        ...
+
 
 _runtime: RuntimeBridge | None = None
 

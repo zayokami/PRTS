@@ -9,12 +9,14 @@ skill / task 内的 ``prts.client.notify(...)`` / ``prts.workspace.read(...)``
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any
 
 from .llm import ChatMessage, LlmClient
+from .llm.embedding import EmbeddingClient
 from .memory import SqliteStore
 from .tools import ToolRegistry
 
@@ -74,11 +76,13 @@ class AgentRuntimeBridge:
         store: SqliteStore,
         tools: ToolRegistry,
         llm_client: LlmClient,
+        embedding_client: EmbeddingClient | None = None,
     ) -> None:
         self._workspace_dir = workspace_dir
         self._store = store
         self._tools = tools
         self._llm = llm_client
+        self._embedding = embedding_client
 
     async def notify(
         self,
@@ -165,3 +169,42 @@ class AgentRuntimeBridge:
             }
             for r in rows
         ]
+
+    async def remember(self, text: str, payload: dict[str, Any] | None = None) -> None:
+        if self._embedding is None:
+            logger.debug("remember skipped: no embedding client")
+            return
+        try:
+            vec = await self._embedding.embed(text)
+            await self._tools.invoke(
+                "prts-vector__upsert",
+                {
+                    "id": payload.get("id") if payload else None
+                    or f"mem-{hash(text) & 0xFFFFFFFF:08x}",
+                    "vector": vec,
+                    "payload": payload,
+                },
+            )
+        except Exception:
+            logger.exception("remember failed")
+
+    async def search_memory(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+        if self._embedding is None:
+            return []
+        try:
+            vec = await self._embedding.embed(query)
+            raw = await self._tools.invoke(
+                "prts-vector__search",
+                {"query_vector": vec, "top_k": top_k},
+            )
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            if isinstance(raw, dict) and raw.get("ok"):
+                return [
+                    {"id": r["id"], "distance": r["distance"]}
+                    for r in raw.get("results", [])
+                ]
+            return []
+        except Exception:
+            logger.exception("search_memory failed")
+            return []

@@ -16,8 +16,8 @@ async def history(session_id: str | None = None, limit: int = 50) -> list[dict[s
 
 
 async def search(query: str, top_k: int = 5) -> list[dict[str, Any]]:
-    raise NotImplementedError("P7 阶段接通 sqlite-vec")
+    return await _runtime.get_runtime().search_memory(query, top_k)
 
 
-async def remember(text: str, payload: dict[str, Any] | None = None) -> str:
-    raise NotImplementedError("P7 阶段接通 sqlite-vec")
+async def remember(text: str, payload: dict[str, Any] | None = None) -> None:
+    await _runtime.get_runtime().remember(text, payload)

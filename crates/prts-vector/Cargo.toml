@@ -4,13 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "PRTS 向量检索引擎(P7 阶段接 sqlite-vec)"
+description = "PRTS 向量检索引擎(sqlite-vec) + MCP server"
+
+[[bin]]
+name = "prts-vector"
+path = "src/bin/server.rs"
 
 [dependencies]
-# P7 阶段接通后填充:rusqlite + sqlite-vec / hnsw_rs / rmcp
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
-[lib]
-path = "src/lib.rs"
+rusqlite = { version = "0.34", features = ["bundled"] }
+sqlite-vec = "0.1"
+rmcp = { version = "0.17", features = ["server", "macros", "transport-io"] }
+schemars = "0.8"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"

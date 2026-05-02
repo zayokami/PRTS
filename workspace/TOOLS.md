@@ -25,10 +25,10 @@ P4 阶段:Agent 启动时读取 `workspace/mcp.json`,把声明的每个 MCP serv
 **已知 server**:
 
 - `filesystem` —— 官方 [`@modelcontextprotocol/server-filesystem`](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem),读写本地文件(限制在传入的目录内)。seed 默认指向 `${WORKSPACE_DIR}`。
-- (后续可加 `github` / `brave-search` / `prts-vector` 等)
+- `prts-vector` —— 自研向量检索 MCP server,基于 sqlite-vec。提供 `prts-vector__upsert`(写入向量)和 `prts-vector__search`(L2 最近邻搜索)两个工具。seed 默认 `disabled: true`,启用前需要把 `prts-vector` binary 加入 PATH(或 `cargo build --bin prts-vector` 后用绝对路径)。
 
 ## Rust 守护
 
 - `prts-watcher` —— 文件变更 + cron 触发(P6)
-- `prts-vector` —— 向量检索(P7)
+- `prts-vector` —— 向量检索 MCP server(P7)
 - `prts-audio` —— 语音(P9)
