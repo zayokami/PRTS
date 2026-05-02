@@ -1,6 +1,8 @@
-import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
+
+import { createTelegramBot, createWebhookHandler, startTelegramBot } from "./adapters/telegram.js";
+import { generateWebSessionId, isValidSessionId } from "./session/id.js";
 
 const PORT = Number(process.env.GATEWAY_PORT ?? 4787);
 const AGENT_URL = process.env.AGENT_URL ?? `http://127.0.0.1:${process.env.AGENT_PORT ?? 4788}`;
@@ -76,7 +78,7 @@ app.get<{ Querystring: { session_id?: string } }>(
   (socket, req) => {
     const requested = typeof req.query.session_id === "string" ? req.query.session_id : null;
     const activeSessionId =
-      requested && /^[\w-]{1,64}$/.test(requested) ? requested : randomUUID();
+      requested && isValidSessionId(requested) ? requested : generateWebSessionId();
     let busy = false;
     // WS 关闭时把进行中的 agent fetch 一并中断 —— 否则 agent 会继续算下去,
     // 浪费 LLM token 也吃 SQLite 写盘。
@@ -217,6 +219,21 @@ app.get<{ Querystring: { session_id?: string } }>(
     });
   },
 );
+
+// ===== Telegram Bot (P5) =====
+const botToken = process.env.TELEGRAM_BOT_TOKEN;
+if (botToken) {
+  const bot = createTelegramBot(AGENT_URL, botToken);
+  if (process.env.BOT_MODE === "webhook") {
+    app.post("/telegram/webhook", createWebhookHandler(bot));
+    console.log("[telegram] webhook handler registered at POST /telegram/webhook");
+  } else {
+    // polling 在 Fastify 启动后后台跑,不阻塞 HTTP 服务
+    startTelegramBot(bot).catch((err) => {
+      app.log.error({ err }, "telegram bot failed to start");
+    });
+  }
+}
 
 try {
   await app.listen({ port: PORT, host: "127.0.0.1" });
