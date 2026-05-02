@@ -10,6 +10,9 @@ description = "PRTS 向量检索引擎(sqlite-vec) + MCP server"
 name = "prts-vector"
 path = "src/bin/server.rs"
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }
