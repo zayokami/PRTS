@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 import sys
@@ -37,17 +38,27 @@ _WIN_CMD_WRAPPERS = {"npx", "npm", "yarn", "pnpm", "uvx", "bunx", "bun"}
 def _resolve_command(command: str) -> str:
     """Windows 上把 ``npx`` 之类的 shim 名字补成 ``npx.cmd``。
 
-    在 PATH 上找得到原名就直接用;找不到再尝试 ``.cmd`` 后缀。其他平台原样返回。
+    要点:Windows ``CreateProcess`` (asyncio 子进程的底层实现) 不像 cmd.exe
+    那样自动应用 PATHEXT,所以裸 "npx" 会 ``WinError 2``,即便 PATH 上能找到
+    ``npx.cmd``。``shutil.which`` 自身会找到 ``npx.cmd`` 全路径,但单返回值会
+    丢掉 ``.cmd`` 后缀信息;为了让 spawn 拿到一个能直接跑的字符串,这里:
+
+    - 命令在已知 wrapper 名单里 → 优先尝试 ``.cmd`` 形式(``which`` 找到则返回)。
+    - 否则用原名;``which`` 找到也直接返回原名(用户给的可能就是绝对路径或
+      已带后缀)。
+    其他平台原样返回。
     """
     if sys.platform != "win32":
         return command
-    if shutil.which(command):
-        return command
     base = command.lower()
+    # 关键:wrapper 必须先看 .cmd —— ``which("npx")`` 找到的也是 ``npx.cmd``,
+    # 但只返回 ``command`` 会让 CreateProcess 拿不到能跑的可执行。
     if base in _WIN_CMD_WRAPPERS:
         candidate = command + ".cmd"
         if shutil.which(candidate):
             return candidate
+    if shutil.which(command):
+        return command
     return command
 
 
@@ -176,20 +187,39 @@ class MCPManager:
         self._parent_stack.push_async_callback(_close_child)
 
         try:
-            transport = await child_stack.enter_async_context(stdio_client(params))
-            read_stream, write_stream = transport
-            session = await child_stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
+            async def _bring_up() -> list[str]:
+                transport = await child_stack.enter_async_context(stdio_client(params))
+                read_stream, write_stream = transport
+                session = await child_stack.enter_async_context(
+                    ClientSession(read_stream, write_stream)
+                )
+                await session.initialize()
+                tools_response = await session.list_tools()
+                return register_server_tools(
+                    server_name=name,
+                    session=session,
+                    tools_response=tools_response,
+                    registry=self._registry,
+                    timeout_s=cfg.timeout_seconds,
+                )
+
+            # 整个握手 + list_tools 都纳入超时:坏的 MCP server(比如 spawn 起来
+            # 但永远不响应 initialize)否则会让 agent 启动期永远卡住。``call_tool``
+            # 自己另有 wait_for,这里只兜启动这段。
+            tool_names = await asyncio.wait_for(
+                _bring_up(), timeout=cfg.timeout_seconds
             )
-            await session.initialize()
-            tools_response = await session.list_tools()
-            tool_names = register_server_tools(
-                server_name=name,
-                session=session,
-                tools_response=tools_response,
-                registry=self._registry,
-                timeout_s=cfg.timeout_seconds,
+        except asyncio.TimeoutError:
+            logger.error(
+                "MCP server %r 启动超时 (>%.1fs)", name, cfg.timeout_seconds
             )
+            self._states[name] = MCPServerState(
+                name=name,
+                status="error",
+                error=f"startup timed out after {cfg.timeout_seconds}s",
+                command=cfg.command,
+            )
+            return
         except Exception as exc:  # noqa: BLE001
             logger.exception("MCP server %r 启动失败", name)
             self._states[name] = MCPServerState(

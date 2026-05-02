@@ -35,16 +35,27 @@ class ToolRegistry:
     def register(self, tool: ToolDefinition) -> None:
         existing = self._tools.get(tool.name)
         if existing is not None:
-            # 同名 skill 直接覆盖会让用户的"另一个文件里 @skill('foo')"静默丢失。
-            # 已存在的 source 都是 "skill" 时给出明确警告 + 文件 hint;后期 P4 接 mcp 时
-            # source 不同(比如 mcp 同名工具)再考虑命名空间隔离策略。
+            if existing.source != tool.source:
+                # 跨 source 冲突:拒绝覆盖,保护已存在的注册。
+                # 真实场景:用户写了一个 ``filesystem__foo`` 的 skill,撞到 MCP
+                # server 同名工具。如果允许覆盖,后续 ``unregister_by_source('skill')``
+                # 把 skill 删掉时会连带把 MCP 工具也"丢失",直到 process 重启。
+                logger.error(
+                    "tool name conflict (CROSS-SOURCE): %r already registered "
+                    "with source=%s; refusing to overwrite with source=%s. "
+                    "Rename the new registration to avoid clash with existing tool.",
+                    tool.name,
+                    existing.source,
+                    tool.source,
+                )
+                return
+            # 同 source 覆盖:多半是热加载意图,但不该静默丢失,提示用户。
             logger.warning(
                 "tool name conflict: %r already registered (source=%s),"
-                " new registration (source=%s) will OVERWRITE the previous one. "
+                " new registration will OVERWRITE the previous one. "
                 "Rename one of the @skill / @task to avoid silent loss.",
                 tool.name,
                 existing.source,
-                tool.source,
             )
         self._tools[tool.name] = tool
 
