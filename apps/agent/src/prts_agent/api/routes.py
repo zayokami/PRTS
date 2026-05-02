@@ -133,9 +133,20 @@ async def converse(req: ConverseRequest, request: Request) -> EventSourceRespons
 
 
 @router.get("/sessions/{session_id}/history", response_model=HistoryResponse)
-async def get_history(session_id: str, request: Request) -> HistoryResponse:
+async def get_history(
+    session_id: str, request: Request, limit: int = 500
+) -> HistoryResponse:
+    """返回会话最近 ``limit`` 条 user/assistant 消息(按时间正序)。
+
+    默认 500 是给 Dashboard 首屏渲染用的"足够大"值;真实长会话超出后,旧消息
+    走 P7 向量召回。``limit`` 范围 [1, 5000],超出会被夹到边界,避免单次请求
+    把整张表 dump 到客户端。
+    """
+    # FastAPI 已校验 int 类型,但范围由我们自己卡 —— 否则调用方传 limit=-1
+    # 会被 SQLite 当无限,长会话立刻打回 P0 状态。
+    limit = max(1, min(limit, 5000))
     store = _store(request)
-    rows = await store.history(session_id)
+    rows = await store.history(session_id, limit=limit)
     return HistoryResponse(
         session_id=session_id,
         messages=[

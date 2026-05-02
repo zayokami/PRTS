@@ -48,6 +48,12 @@ from ..tools import ToolRegistry
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 8
+# 每轮 LLM 重新拉的最近消息上限。OpenAI/Anthropic 实际上下文窗口都比这大,
+# 但取到全量 history 在长会话里会(a) 反复序列化几千条消息浪费 CPU,
+# (b) tool 行 content 可能很大(filesystem 工具读 1MB 文件之类),拼起来
+# 直接撑爆 LLM token budget。先做硬截断 —— P7 接 sqlite-vec 后改成
+# "向量召回 + 最近 N 条" 混合上下文。
+HISTORY_WINDOW = 200
 
 
 def _stored_to_chat(messages: list) -> list[ChatMessage]:
@@ -154,7 +160,7 @@ class AgentLoop:
         notify_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         nq_token = bind_notify_queue(notify_queue)
 
-        history_rows = await self._store.history(session_id)
+        history_rows = await self._store.history(session_id, limit=HISTORY_WINDOW)
         ctx_token = prts_set(
             PrtsCallContext(
                 session_id=session_id,
@@ -170,7 +176,11 @@ class AgentLoop:
         try:
             for iteration in range(MAX_ITERATIONS):
                 # 每轮重新拉 history,这样新写入的 assistant + tool 行立刻可见。
-                history_rows = await self._store.history(session_id)
+                # 用 HISTORY_WINDOW 截最近 N 条;超出窗口的老消息丢给 LLM 看不到,
+                # 一定程度影响长跨度回忆,但避免长会话 token 溢出 / 内存膨胀。
+                history_rows = await self._store.history(
+                    session_id, limit=HISTORY_WINDOW
+                )
                 messages: list[ChatMessage] = []
                 if system_prompt:
                     messages.append({"role": "system", "content": system_prompt})
@@ -188,7 +198,7 @@ class AgentLoop:
                 pending_calls: list[dict[str, Any]] = []
                 assistant_text_acc: list[str] = []
                 end_evt: EndEvent | None = None
-                stream_failed: BaseException | None = None
+                stream_failed: Exception | None = None
 
                 try:
                     async for evt in self._llm.stream_chat(messages, tools=tools_arg):
@@ -203,10 +213,13 @@ class AgentLoop:
                             )
                         elif isinstance(evt, EndEvent):
                             end_evt = evt
-                except BaseException as exc:  # noqa: BLE001
-                    # LLM 流半路异常:把已经收到的文本 / tool_calls 落库,然后冒泡。
+                except Exception as exc:  # noqa: BLE001
+                    # LLM 流半路异常:把已经收到的文本 / tool_calls 落库,然后告诉前端。
                     # 不写库的话,前端拿到的 token 已经渲染但 history 没有这条 assistant,
                     # 下一轮会出现"用户视角看到了 PRTS 说话但 LLM 视角没说过"的悖论。
+                    # 重要:这里 *不* 捕 BaseException —— ``asyncio.CancelledError`` /
+                    # ``KeyboardInterrupt`` 必须直接冒泡到 finally,保留协作取消语义,
+                    # 否则 uvicorn shutdown / 客户端断开都会被吞,半成品状态反而被持久化。
                     logger.exception("stream_chat failed mid-stream")
                     stream_failed = exc
 

@@ -98,8 +98,26 @@ class AgentRuntimeBridge:
         return await self._tools.invoke(name, arguments)
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
-        msgs: list[ChatMessage] = [ChatMessage(role=m["role"], content=m["content"]) for m in messages]  # type: ignore[typeddict-item]
-        return await self._llm.chat(msgs)
+        # 透传 OpenAI 风格的 tool 字段。``prts.llm.chat`` 的常规用法是单轮翻译 /
+        # 总结,但用户也可能塞完整 history 进来做"基于历史的二次推理" —— 那时
+        # 必须保留 ``tool_calls`` / ``tool_call_id`` / ``name``,否则下游 LLM
+        # 会拿到孤立的 "tool" 消息(没有对应的 assistant.tool_calls),很多
+        # provider 会直接 400 报错。
+        msgs: list[ChatMessage] = []
+        for m in messages:
+            entry: ChatMessage = {
+                "role": m["role"],
+                "content": m.get("content", ""),
+            }
+            for opt_key in ("tool_calls", "tool_call_id", "name"):
+                if opt_key in m:
+                    entry[opt_key] = m[opt_key]  # type: ignore[literal-required]
+            msgs.append(entry)
+        # tools 仅在用户明确传时才透传:默认不带,符合 ``prts.llm.chat`` 的
+        # "纯文本辅助调用" 语义。其他未识别 kwargs 静默忽略,避免 LLM 客户端
+        # 因无关参数报错。
+        tools = kwargs.get("tools")
+        return await self._llm.chat(msgs, tools=tools)
 
     async def read_workspace(self, path: str) -> str:
         target = _safe_workspace_path(self._workspace_dir, path)

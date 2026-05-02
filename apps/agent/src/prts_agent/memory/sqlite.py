@@ -225,6 +225,24 @@ class SqliteStore:
         return out
 
 
-def init_store() -> SqliteStore:
-    db_path = Path(os.getenv("PRTS_DB_PATH", "./db/prts.db")).expanduser()
+def init_store(workspace_dir: Path | None = None) -> SqliteStore:
+    """构造 ``SqliteStore``。
+
+    路径优先级:
+    1. ``$PRTS_DB_PATH``(用户显式覆盖,绝对/相对都可)
+    2. ``<workspace_dir>/db/prts.db``(workspace 提供时;让 DB 跟着 workspace 走,
+       开发者切换 ``PRTS_WORKSPACE_DIR`` 不会让 prod 库被踢到一旁)
+    3. ``./db/prts.db``(都没给时的最后兜底,基本只在测试 / 临时跑)
+
+    曾经的实现只有路径 (3),意味着从不同 CWD 启动 ``prts-agent`` 会落在不同
+    位置,用户的 sessions/messages 会"消失"。把 workspace 作为默认锚点更符合
+    "本地优先"的设计。
+    """
+    env = os.getenv("PRTS_DB_PATH")
+    if env:
+        db_path = Path(env).expanduser()
+    elif workspace_dir is not None:
+        db_path = workspace_dir / "db" / "prts.db"
+    else:
+        db_path = Path("./db/prts.db")
     return SqliteStore(db_path)

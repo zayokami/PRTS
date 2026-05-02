@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     workspace = resolve_workspace_dir()
-    store: SqliteStore = init_store()
+    store: SqliteStore = init_store(workspace_dir=workspace)
     await store.ensure_schema()
 
     llm_client = build_llm_client()
