@@ -76,8 +76,12 @@ impl VectorServer {
             Ok(rows) => {
                 let results: Vec<_> = rows
                     .into_iter()
-                    .map(|(id, distance)| {
-                        serde_json::json!({"id": id, "distance": distance})
+                    .map(|(id, distance, payload)| {
+                        let mut obj = serde_json::json!({"id": id, "distance": distance});
+                        if let Some(p) = payload {
+                            obj["payload"] = serde_json::Value::String(p);
+                        }
+                        obj
                     })
                     .collect();
                 serde_json::json!({"ok": true, "results": results}).to_string()

@@ -94,10 +94,14 @@ async def test_vector_mcp_server() -> None:
             )
         ok(f"prts-vector ready, tools={state.tool_names}")
 
-        # upsert
+        # upsert (带 payload)
         await registry.invoke(
             "prts-vector__upsert",
-            {"id": "a", "vector": [1.0, 0.0, 0.0, 0.0], "payload": None},
+            {
+                "id": "a",
+                "vector": [1.0, 0.0, 0.0, 0.0],
+                "payload": {"tag": "smoke", "text": "hello vec"},
+            },
         )
         ok("prts-vector__upsert 成功")
 
@@ -117,6 +121,11 @@ async def test_vector_mcp_server() -> None:
         if not results:
             fail("search 未返回任何结果")
         assert_eq(results[0]["id"], "a", "最近邻应为 a")
+        assert_eq(
+            results[0].get("payload"),
+            '{"tag":"smoke","text":"hello vec"}',
+            "payload 应随 search 返回",
+        )
     finally:
         await parent_stack.aclose()
         __import__("shutil").rmtree(td, ignore_errors=True)
@@ -162,6 +171,11 @@ async def test_bridge_memory() -> None:
         if not hits:
             fail("search_memory 未返回结果")
         assert_eq(hits[0]["id"], "smoke-1", "search_memory 命中 id")
+        assert_eq(
+            hits[0].get("payload"),
+            '{"id":"smoke-1","tag":"smoke","text":"测试文本"}',
+            "search_memory 应带回 payload",
+        )
         ok(f"bridge.search_memory 返回 {len(hits)} 条")
     finally:
         await parent_stack.aclose()

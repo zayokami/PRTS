@@ -50,12 +50,10 @@ from ..tools import ToolRegistry
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 8
-# 每轮 LLM 重新拉的最近消息上限。OpenAI/Anthropic 实际上下文窗口都比这大,
-# 但取到全量 history 在长会话里会(a) 反复序列化几千条消息浪费 CPU,
-# (b) tool 行 content 可能很大(filesystem 工具读 1MB 文件之类),拼起来
-# 直接撑爆 LLM token budget。先做硬截断 —— P7 接 sqlite-vec 后改成
-# "向量召回 + 最近 N 条" 混合上下文。
-HISTORY_WINDOW = 200
+# 短期即时上下文条数。向量检索负责召回跨时间/跨 session 的相关历史,
+# 这里只保留最近 N 条保证多轮工具调用的连贯性。
+RECENT_WINDOW = 20
+VECTOR_TOPK = 5
 
 
 def _stored_to_chat(messages: list) -> list[ChatMessage]:
@@ -164,7 +162,8 @@ class AgentLoop:
         notify_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         nq_token = bind_notify_queue(notify_queue)
 
-        history_rows = await self._store.history(session_id, limit=HISTORY_WINDOW)
+        # context 供 skill 脚本读取,取最近 N 条足够
+        ctx_history = await self._store.history(session_id, limit=RECENT_WINDOW)
         ctx_token = prts_set(
             PrtsCallContext(
                 session_id=session_id,
@@ -172,23 +171,16 @@ class AgentLoop:
                 channel=channel,
                 history=[
                     {"role": m.role, "content": m.content, "created_at": m.created_at}
-                    for m in history_rows
+                    for m in ctx_history
                 ],
             )
         )
 
         try:
             for iteration in range(MAX_ITERATIONS):
-                # 每轮重新拉 history,这样新写入的 assistant + tool 行立刻可见。
-                # 用 HISTORY_WINDOW 截最近 N 条;超出窗口的老消息丢给 LLM 看不到,
-                # 一定程度影响长跨度回忆,但避免长会话 token 溢出 / 内存膨胀。
-                history_rows = await self._store.history(
-                    session_id, limit=HISTORY_WINDOW
+                messages = await self._build_messages(
+                    session_id, user_content, system_prompt
                 )
-                messages: list[ChatMessage] = []
-                if system_prompt:
-                    messages.append({"role": "system", "content": system_prompt})
-                messages.extend(_stored_to_chat(history_rows))
 
                 tool_defs = self._tools.all()
                 openai_tools = self._tools.to_openai_tools() if tool_defs else None
@@ -347,6 +339,61 @@ class AgentLoop:
         finally:
             unbind_notify_queue(nq_token)
             prts_reset(ctx_token)
+
+    async def _build_messages(
+        self,
+        session_id: str,
+        user_content: str,
+        system_prompt: str,
+    ) -> list[ChatMessage]:
+        """混合上下文构造: 最近 N 条保证连贯 + 向量召回跨时空相关历史。"""
+        recent = await self._store.history(session_id, limit=RECENT_WINDOW)
+
+        recalled_texts: list[str] = []
+        if self._embedding is not None:
+            try:
+                vec = await self._embedding.embed(user_content)
+                raw = await self._tools.invoke(
+                    "prts-vector__search",
+                    {"query_vector": vec, "top_k": VECTOR_TOPK},
+                )
+                if isinstance(raw, str):
+                    raw = json.loads(raw)
+                if isinstance(raw, dict) and raw.get("ok"):
+                    for r in raw.get("results", []):
+                        payload_str = r.get("payload")
+                        if payload_str:
+                            try:
+                                payload = json.loads(payload_str)
+                                text = payload.get("text", "")
+                            except (TypeError, ValueError):
+                                text = payload_str
+                            if text:
+                                recalled_texts.append(text)
+            except Exception:
+                logger.exception("vector recall failed")
+
+        system_parts: list[str] = []
+        if system_prompt:
+            system_parts.append(system_prompt)
+        if recalled_texts:
+            seen: set[str] = set()
+            unique_lines: list[str] = []
+            for t in recalled_texts:
+                if t not in seen:
+                    seen.add(t)
+                    unique_lines.append(t)
+            system_parts.append(
+                "以下是与当前问题相关的历史回忆:\n"
+                + "\n".join(f"- {line}" for line in unique_lines)
+            )
+
+        messages: list[ChatMessage] = []
+        full_system = "\n\n".join(system_parts)
+        if full_system:
+            messages.append({"role": "system", "content": full_system})
+        messages.extend(_stored_to_chat(recent))
+        return messages
 
     async def _auto_remember(
         self,

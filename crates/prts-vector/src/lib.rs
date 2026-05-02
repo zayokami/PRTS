@@ -45,9 +45,9 @@ impl VectorStore {
         let conn = Connection::open(path)
             .with_context(|| format!("open vec db {}", path.display()))?;
 
-        // 建虚拟表:embedding 是 float[DIM] 向量列,+id 是普通文本列。
+        // 建虚拟表:embedding 是 float[DIM] 向量列,+id / +payload 是普通文本列。
         let sql = format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(embedding float[{dim}], +id TEXT)"
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(embedding float[{dim}], +id TEXT, +payload TEXT)"
         );
         conn.execute(&sql, []).context("create vec0 virtual table")?;
 
@@ -74,22 +74,17 @@ impl VectorStore {
 
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO vec_items(id, embedding) VALUES (?, ?)",
-                params![id, blob],
+                "INSERT OR REPLACE INTO vec_items(id, embedding, payload) VALUES (?, ?, ?)",
+                params![id, blob, payload_text.as_deref().unwrap_or("")],
             )
             .context("vec upsert")?;
-
-        // sqlite-vec 的虚拟表目前不支持普通列动态扩展(payload)。
-        // 为简化,MVP 把 payload 忽略写入,仅保留 id + vec。
-        // 如需 payload,可再建一张普通表做 JOIN;当前足够支撑召回验证。
-        let _ = payload_text;
         Ok(())
     }
 
     /// 最近邻搜索。
     ///
-    /// 返回 `[(id, distance), ...]` 按距离升序(L2;对归一化向量等价于余弦距离)。
-    pub fn search(&self, query_vec: &[f32], top_k: usize) -> Result<Vec<(String, f64)>> {
+    /// 返回 `[(id, distance, payload), ...]` 按距离升序(L2;对归一化向量等价于余弦距离)。
+    pub fn search(&self, query_vec: &[f32], top_k: usize) -> Result<Vec<(String, f64, Option<String>)>> {
         if query_vec.len() != self.dim {
             anyhow::bail!(
                 "query dim mismatch: expected {}, got {}",
@@ -103,7 +98,7 @@ impl VectorStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, distance FROM vec_items \
+                "SELECT id, distance, payload FROM vec_items \
                  WHERE embedding MATCH ? \
                  ORDER BY distance \
                  LIMIT ?",
@@ -114,7 +109,8 @@ impl VectorStore {
             .query_map(params![blob, limit], |row| {
                 let id: String = row.get(0)?;
                 let distance: f64 = row.get(1)?;
-                Ok((id, distance))
+                let payload: Option<String> = row.get(2)?;
+                Ok((id, distance, payload))
             })
             .context("search query")?;
 
@@ -136,7 +132,9 @@ mod tests {
         let db = tmp.path().join("test.db");
         let store = VectorStore::open(&db, 4).unwrap();
 
-        store.upsert("a", &[1.0, 0.0, 0.0, 0.0], None).unwrap();
+        store
+            .upsert("a", &[1.0, 0.0, 0.0, 0.0], Some(serde_json::json!({"tag": "a"})))
+            .unwrap();
         store.upsert("b", &[0.0, 1.0, 0.0, 0.0], None).unwrap();
         store.upsert("c", &[0.0, 0.0, 1.0, 0.0], None).unwrap();
 
@@ -144,5 +142,10 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, "a");
         assert!(results[0].1 < results[1].1);
+        assert_eq!(
+            results[0].2,
+            Some(r#"{"tag":"a"}"#.to_string()),
+            "payload 应被写回"
+        );
     }
 }

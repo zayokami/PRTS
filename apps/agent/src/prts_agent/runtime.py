@@ -9,6 +9,7 @@ skill / task 内的 ``prts.client.notify(...)`` / ``prts.workspace.read(...)``
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from contextvars import ContextVar, Token
@@ -176,13 +177,14 @@ class AgentRuntimeBridge:
             return
         try:
             vec = await self._embedding.embed(text)
+            merged = {**(payload or {}), "text": text}
             await self._tools.invoke(
                 "prts-vector__upsert",
                 {
-                    "id": payload.get("id") if payload else None
-                    or f"mem-{hash(text) & 0xFFFFFFFF:08x}",
+                    "id": (payload.get("id") if payload else None)
+                    or f"mem-{hashlib.sha256(text.encode()).hexdigest()[:16]}",
                     "vector": vec,
-                    "payload": payload,
+                    "payload": merged,
                 },
             )
         except Exception:
@@ -201,7 +203,11 @@ class AgentRuntimeBridge:
                 raw = json.loads(raw)
             if isinstance(raw, dict) and raw.get("ok"):
                 return [
-                    {"id": r["id"], "distance": r["distance"]}
+                    {
+                        "id": r["id"],
+                        "distance": r["distance"],
+                        "payload": r.get("payload"),
+                    }
                     for r in raw.get("results", [])
                 ]
             return []
