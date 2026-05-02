@@ -6,11 +6,21 @@ license.workspace = true
 authors.workspace = true
 description = "PRTS 文件 / cron 守护进程(P6 阶段实现)"
 
+[[bin]]
+name = "prts-watcher"
+path = "src/main.rs"
+
 [dependencies]
-# P6 阶段填充:notify + tokio-cron-scheduler + reqwest + rmcp
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
-[lib]
-path = "src/lib.rs"
+notify = { version = "7.0", default-features = false, features = ["macos_kqueue"] }
+tokio-cron-scheduler = "0.13"
+reqwest = { version = "0.12", features = ["json"] }
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
