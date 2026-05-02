@@ -54,6 +54,10 @@ MAX_ITERATIONS = 8
 # 这里只保留最近 N 条保证多轮工具调用的连贯性。
 RECENT_WINDOW = 20
 VECTOR_TOPK = 5
+# 单个 tool 结果最大字符数 ≈ 4k token。超过会截断,避免一次 ``filesystem__read_text_file``
+# 把整篇大文件灌进 history,后续每轮都重发一遍把 prompt cache 顶飞 + 吃光上下文。
+# 截断标记里告诉 LLM 完整大小,必要时它能用更窄的参数(行号区间、关键词)重调。
+MAX_TOOL_RESULT_CHARS = 16000
 
 
 def _stored_to_chat(messages: list) -> list[ChatMessage]:
@@ -131,6 +135,27 @@ def _serialize_tool_result(result: Any) -> str:
         return json.dumps(result, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return str(result)
+
+
+def _truncate_for_llm(serialized: str) -> str:
+    """tool 结果太长就裁掉尾巴,留个明确标记。
+
+    动机:某个 tool 一次返回 200KB(典型场景:读大文件、密集向量检索结果)写进
+    history 后,后续每一轮 LLM 都要重发整段;不仅烧 token,还会让 Anthropic
+    prompt cache 命中率掉到 0(每轮 tool 消息内容相同但前缀变长不算缓存)。
+
+    截断后丢进 history 的就是"短前缀 + 提示",LLM 能看到结果开头并知道被截了,
+    需要细节时用 offset / 缩窄关键词重调即可。
+    """
+    if len(serialized) <= MAX_TOOL_RESULT_CHARS:
+        return serialized
+    head = serialized[:MAX_TOOL_RESULT_CHARS]
+    return (
+        f"{head}\n\n"
+        f"[... truncated: full result was {len(serialized)} chars, "
+        f"showing first {MAX_TOOL_RESULT_CHARS}. "
+        "Re-call this tool with narrower scope if more detail needed.]"
+    )
 
 
 class AgentLoop:
@@ -303,7 +328,7 @@ class AgentLoop:
                     batch.append(
                         PendingMessage(
                             role="tool",
-                            content=_serialize_tool_result(result),
+                            content=_truncate_for_llm(_serialize_tool_result(result)),
                             meta={
                                 "tool_call_id": call["id"],
                                 "tool_name": call["name"],
