@@ -1,5 +1,10 @@
 import { Bot, webhookCallback } from "grammy";
 import type { FastifyReply, FastifyRequest } from "fastify";
+import { createWriteStream } from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 import { telegramSessionId } from "../session/id.js";
 
@@ -52,6 +57,61 @@ async function consumeSse(resp: Response): Promise<AgentEvent[]> {
     }
   }
   return events;
+}
+
+const TEXT_EXTENSIONS = new Set([
+  ".txt", ".md", ".markdown", ".json", ".js", ".ts", ".jsx", ".tsx",
+  ".py", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".hpp", ".cs",
+  ".rb", ".php", ".sh", ".bash", ".zsh", ".ps1", ".csv", ".log",
+  ".yaml", ".yml", ".xml", ".html", ".htm", ".css", ".scss", ".sass",
+  ".ini", ".toml", ".cfg", ".conf", ".sql", ".gitignore",
+]);
+
+function isTextFile(filename: string): boolean {
+  const ext = path.extname(filename).toLowerCase();
+  return TEXT_EXTENSIONS.has(ext);
+}
+
+/** 读取文本文件前 maxBytes 字节,返回 UTF-8 字符串(超长截断)。 */
+async function readTextPreview(filePath: string, maxBytes = 50_000): Promise<string | null> {
+  try {
+    const handle = await fs.open(filePath, "r");
+    try {
+      const buf = Buffer.alloc(maxBytes);
+      const { bytesRead } = await handle.read(buf, 0, maxBytes, 0);
+      let text = buf.toString("utf-8", 0, bytesRead);
+      if (bytesRead === maxBytes) text += "\n…(截断)";
+      return text;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** 从 Telegram CDN 下载文件到本地 destPath,返回最终路径。 */
+async function downloadTelegramFile(
+  bot: Bot,
+  token: string,
+  fileId: string,
+  destPath: string,
+): Promise<string | null> {
+  try {
+    const file = await bot.api.getFile(fileId);
+    if (!file.file_path) return null;
+    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    await fs.mkdir(path.dirname(destPath), { recursive: true });
+    const body = resp.body;
+    if (!body) return null;
+    await pipeline(Readable.fromWeb(body as any), createWriteStream(destPath));
+    return destPath;
+  } catch (err) {
+    console.error("[telegram] download failed:", err);
+    return null;
+  }
 }
 
 /** 向 Agent 发 converse 请求,返回聚合后的 Markdown 回复文本。 */
@@ -109,50 +169,167 @@ async function fetchAgentReply(
   return parts.join("").trim() || "(无回复)";
 }
 
+/**
+ * 为 Telegram 消息构造统一文本描述(包含附件元信息)。
+ *
+ * 图片:保留 caption,附加本地保存路径。
+ * 语音:转录文本(如有)或标记为语音消息。
+ * 文件:如果是文本文件则内联内容预览,否则仅保留文件名和路径。
+ */
+async function buildMediaContent(
+  bot: Bot,
+  token: string,
+  workspaceDir: string,
+  chatId: number,
+  message: any,
+): Promise<string> {
+  const ts = Date.now();
+  const baseDir = path.join(workspaceDir, "telegram", "media", String(chatId));
+
+  // Photo
+  if (message.photo && message.photo.length > 0) {
+    const photo = message.photo[message.photo.length - 1]; // 最大尺寸
+    const fileName = `${ts}_photo.jpg`;
+    const dest = path.join(baseDir, fileName);
+    const saved = await downloadTelegramFile(bot, token, photo.file_id, dest);
+    const caption = message.caption || "";
+    const lines = caption ? [caption] : ["[用户发送了一张图片]"];
+    if (saved) lines.push(`[文件: ${saved}]`);
+    return lines.join("\n");
+  }
+
+  // Voice
+  if (message.voice) {
+    const ext = message.voice.mime_type?.includes("ogg") ? ".ogg" : ".audio";
+    const fileName = `${ts}_voice${ext}`;
+    const dest = path.join(baseDir, fileName);
+    const saved = await downloadTelegramFile(bot, token, message.voice.file_id, dest);
+    const caption = message.caption || "";
+    const lines = caption ? [caption] : ["[用户发送了一段语音消息]"];
+    if (saved) lines.push(`[文件: ${saved}]`);
+    return lines.join("\n");
+  }
+
+  // Audio (music files etc.)
+  if (message.audio) {
+    const fileName = message.audio.file_name || `${ts}_audio.${message.audio.mime_type?.split("/")[1] || "bin"}`;
+    const dest = path.join(baseDir, fileName);
+    const saved = await downloadTelegramFile(bot, token, message.audio.file_id, dest);
+    const caption = message.caption || "";
+    const title = message.audio.title || message.audio.performer || "";
+    const lines = caption ? [caption] : [title ? `[音频] ${title}` : "[用户发送了一个音频文件]"];
+    if (saved) lines.push(`[文件: ${saved}]`);
+    return lines.join("\n");
+  }
+
+  // Document
+  if (message.document) {
+    const fileName = message.document.file_name || `${ts}_document.bin`;
+    const dest = path.join(baseDir, fileName);
+    const saved = await downloadTelegramFile(bot, token, message.document.file_id, dest);
+    const caption = message.caption || "";
+    const lines = caption ? [caption] : [];
+
+    if (saved) {
+      if (isTextFile(fileName)) {
+        const preview = await readTextPreview(saved, 20_000);
+        if (preview !== null) {
+          lines.push(`[文件: ${saved}]\n\`\`\`\n${preview}\n\`\`\``);
+        } else {
+          lines.push(`[文件: ${saved}]`);
+        }
+      } else {
+        lines.push(`[文件: ${saved}]`);
+      }
+    }
+    if (lines.length === 0) lines.push("[用户发送了一个文件]");
+    return lines.join("\n");
+  }
+
+  // Video / VideoNote
+  if (message.video || message.video_note) {
+    const vid = message.video || message.video_note;
+    const fileName = message.video?.file_name || `${ts}_video.mp4`;
+    const dest = path.join(baseDir, fileName);
+    const saved = await downloadTelegramFile(bot, token, vid.file_id, dest);
+    const caption = message.caption || "";
+    const lines = caption ? [caption] : [message.video ? "[用户发送了一个视频]" : "[用户发送了一个视频笔记]"];
+    if (saved) lines.push(`[文件: ${saved}]`);
+    return lines.join("\n");
+  }
+
+  return "[未知消息类型]";
+}
+
 /** 创建一个配置好的 grammY Bot 实例。
  *
  * 每个 chat 维护自己的 AbortController:如果用户在新消息到达时上一轮
  * 还没回复完,旧请求会被取消,避免串台和重复回复。
+ *
+ * @param workspaceDir 本地工作区目录,用于保存下载的 Telegram 媒体文件。
  */
-export function createTelegramBot(agentUrl: string, token: string): Bot {
+export function createTelegramBot(agentUrl: string, token: string, workspaceDir: string): Bot {
   const bot = new Bot(token);
 
   // chatId → 当前进行中的 AbortController
   const inflight = new Map<number, AbortController>();
 
-  bot.on("message:text", async (ctx) => {
-    const chatId = ctx.chat.id;
-    const text = ctx.message.text;
-
-    // 取消上一轮(如果还在跑)
+  async function handleMessage(chatId: number, content: string) {
     const old = inflight.get(chatId);
     if (old) {
-      try {
-        old.abort();
-      } catch {
-        /* ignore */
-      }
+      try { old.abort(); } catch { /* ignore */ }
     }
 
     const ac = new AbortController();
     inflight.set(chatId, ac);
 
     try {
-      const reply = await fetchAgentReply(agentUrl, chatId, text, ac);
-      await ctx.reply(reply, { parse_mode: "Markdown" });
+      const reply = await fetchAgentReply(agentUrl, chatId, content, ac);
+      await bot.api.sendMessage(chatId, reply, { parse_mode: "Markdown" });
     } catch (err) {
       const name = (err as { name?: string }).name;
-      if (name === "AbortError") {
-        // 被新消息取消 —— 静默,不做任何回复
-        return;
-      }
+      if (name === "AbortError") return;
       const msg = err instanceof Error ? err.message : String(err);
-      await ctx.reply(`PRTS 处理出错: ${msg}`);
+      await bot.api.sendMessage(chatId, `PRTS 处理出错: ${msg}`);
     } finally {
       if (inflight.get(chatId) === ac) {
         inflight.delete(chatId);
       }
     }
+  }
+
+  bot.on("message:text", async (ctx) => {
+    await handleMessage(ctx.chat.id, ctx.message.text);
+  });
+
+  bot.on("message:photo", async (ctx) => {
+    const content = await buildMediaContent(bot, token, workspaceDir, ctx.chat.id, ctx.message);
+    await handleMessage(ctx.chat.id, content);
+  });
+
+  bot.on("message:voice", async (ctx) => {
+    const content = await buildMediaContent(bot, token, workspaceDir, ctx.chat.id, ctx.message);
+    await handleMessage(ctx.chat.id, content);
+  });
+
+  bot.on("message:audio", async (ctx) => {
+    const content = await buildMediaContent(bot, token, workspaceDir, ctx.chat.id, ctx.message);
+    await handleMessage(ctx.chat.id, content);
+  });
+
+  bot.on("message:document", async (ctx) => {
+    const content = await buildMediaContent(bot, token, workspaceDir, ctx.chat.id, ctx.message);
+    await handleMessage(ctx.chat.id, content);
+  });
+
+  bot.on("message:video", async (ctx) => {
+    const content = await buildMediaContent(bot, token, workspaceDir, ctx.chat.id, ctx.message);
+    await handleMessage(ctx.chat.id, content);
+  });
+
+  bot.on("message:video_note", async (ctx) => {
+    const content = await buildMediaContent(bot, token, workspaceDir, ctx.chat.id, ctx.message);
+    await handleMessage(ctx.chat.id, content);
   });
 
   return bot;

@@ -1,5 +1,7 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
+import os from "node:os";
+import path from "node:path";
 
 import { createTelegramBot, createWebhookHandler, startTelegramBot } from "./adapters/telegram.js";
 import { generateWebSessionId, isValidSessionId } from "./session/id.js";
@@ -234,8 +236,9 @@ app.get<{ Querystring: { session_id?: string } }>(
 
 // ===== Telegram Bot (P5) =====
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
+const workspaceDir = process.env.PRTS_WORKSPACE_DIR || path.join(os.homedir(), ".prts", "workspace");
 if (botToken) {
-  const bot = createTelegramBot(AGENT_URL, botToken);
+  const bot = createTelegramBot(AGENT_URL, botToken, workspaceDir);
   if (process.env.BOT_MODE === "webhook") {
     app.post("/telegram/webhook", createWebhookHandler(bot));
     console.log("[telegram] webhook handler registered at POST /telegram/webhook");

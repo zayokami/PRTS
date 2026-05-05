@@ -73,6 +73,23 @@ P8 起 LLM 客户端解析响应中的 `usage` 字段,让 Agent 知道实际消�
 | `PRTS_SUMMARY_INTERVAL` | 自动摘要触发轮数,0 关闭 | `10` |
 | `LLM_CONTEXT_LIMIT` | 覆盖模型上下文限制 | 自动检测 |
 
+## Telegram Bot (P5)
+
+Gateway 内置 grammY bot,支持以下消息类型:
+
+- **文本** (`message:text`) —— 直接转发给 Agent
+- **图片** (`message:photo`) —— 下载到 `workspace/telegram/media/{chatId}/`,内容附加 `[文件: /path/to/photo.jpg]`
+- **语音** (`message:voice`) —— 下载为 `.ogg`,内容标记 `[语音消息]`
+- **音频** (`message:audio`) —— 下载音乐文件,保留标题/艺术家信息
+- **文件** (`message:document`) —— 文本文件(`.txt` / `.md` / `.py` 等)自动内联内容预览,二进制文件仅保留路径
+- **视频** (`message:video`) / **视频笔记** (`message:video_note`) —— 下载并附加路径
+
+所有媒体下载共用 `PRTS_WORKSPACE_DIR` 作为根目录(默认 `~/.prts/workspace`)。
+
+环境变量:
+- `TELEGRAM_BOT_TOKEN` —— bot token(不设置则禁用)
+- `BOT_MODE` —— `polling`(默认) 或 `webhook`
+
 ## Rust 守护
 
 - `prts-watcher` —— 文件变更 + cron 触发(P6)
