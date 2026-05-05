@@ -58,8 +58,8 @@ app.post("/mcp/health-check", async (req, reply) => {
 });
 
 interface InboundUserFrame {
-  type: "user";
-  content: string;
+  type: "user" | "ping";
+  content?: string;
 }
 
 type OutboundFrame =
@@ -69,7 +69,8 @@ type OutboundFrame =
   | { type: "tool_result"; id: string; name: string; result?: unknown; error?: unknown }
   | { type: "notify"; message: string; kind?: string; payload?: unknown }
   | { type: "done"; stop_reason?: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "pong" };
 
 /** 解析 SSE: `event: x\ndata: {...}\n\n` —— 上游 sse-starlette 用 CRLF,调用方需先规范化。 */
 function* parseSseChunks(buffer: string): Generator<{ event: string; data: string }, string> {
@@ -137,6 +138,11 @@ app.get<{ Querystring: { session_id?: string } }>(
         send({ type: "error", message: "bad json" });
         return;
       }
+      if (frame.type === "ping") {
+        send({ type: "pong" });
+        return;
+      }
+
       if (frame.type !== "user" || typeof frame.content !== "string") {
         send({ type: "error", message: "expected {type:'user', content:string}" });
         return;

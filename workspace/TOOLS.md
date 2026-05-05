@@ -75,6 +75,16 @@ P8 起 LLM 客户端解析响应中的 `usage` 字段,让 Agent 知道实际消�
 | `PRTS_SUMMARY_INTERVAL` | 自动摘要触发轮数,0 关闭 | `10` |
 | `LLM_CONTEXT_LIMIT` | 覆盖模型上下文限制 | 自动检测 |
 
+## Web Dashboard
+
+前端通过 WebSocket (`/ws/chat`) 与 Gateway 实时通信:
+
+- **自动重连** —— 连接断开后指数退避重试(1s→2s→4s…最大30s),带重连次数指示
+- **心跳保活** —— 每 30s 前端发 `ping`,Gateway 回 `pong`,防止中间件静默断连
+- **平滑滚动** —— 新消息自动平滑滚动到底部
+- **状态指示** —— 顶部状态栏显示 ● 连接中/就绪/生成中/重连中/已断开,并带颜色区分
+- **会话恢复** —— 刷新页面后通过 `localStorage` 中的 `session_id` 恢复同一会话
+
 ## Telegram Bot (P5)
 
 Gateway 内置 grammY bot,支持以下消息类型:
