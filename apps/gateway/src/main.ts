@@ -24,6 +24,12 @@ app.get<{ Params: { id: string } }>("/sessions/:id/history", async (req, reply) 
   reply.code(resp.status).type("application/json").send(await resp.text());
 });
 
+// P8: 透传到 agent: GET /agent/v1/sessions/:id/summaries
+app.get<{ Params: { id: string } }>("/sessions/:id/summaries", async (req, reply) => {
+  const resp = await fetch(`${AGENT_URL}/agent/v1/sessions/${encodeURIComponent(req.params.id)}/summaries`);
+  reply.code(resp.status).type("application/json").send(await resp.text());
+});
+
 // 透传到 agent: GET /agent/v1/skills
 app.get("/skills", async (_req, reply) => {
   const resp = await fetch(`${AGENT_URL}/agent/v1/skills`);

@@ -85,151 +85,21 @@ class TasksResponse(BaseModel):
     tasks: list[TaskInfo]
 
 
-class FsEventRequest(BaseModel):
-    changed_files: list[str] = []
+class SummaryInfo(BaseModel):
+    id: str
+    summary: str
+    key_facts: list[str]
+    decisions: list[str]
+    todos: list[str]
+    message_start: int
+    message_end: int
+    importance: float
+    created_at: str
 
 
-class FsEventResponse(BaseModel):
-    reloaded: bool
-    tasks: list[TaskInfo]
-    errors: list[str]
-
-
-class CronEventRequest(BaseModel):
-    task_name: str
-
-
-class CronEventResponse(BaseModel):
-    ok: bool
-    result: Any | None = None
-    error: str | None = None
-
-
-def _store(req: Request) -> SqliteStore:
-    return req.app.state.store  # type: ignore[no-any-return]
-
-
-def _tools(req: Request) -> ToolRegistry:
-    return req.app.state.tools  # type: ignore[no-any-return]
-
-
-def _loop(req: Request) -> AgentLoop:
-    return req.app.state.agent_loop  # type: ignore[no-any-return]
-
-
-def _workspace_dir(req: Request) -> Path:
-    return req.app.state.workspace_dir  # type: ignore[no-any-return]
-
-
-def _sse_safe_dumps(data: Any) -> str:
-    """SSE 帧 data 的安全序列化。
-
-    - ``ensure_ascii=False``:中文按字面输出,不让 \\uXXXX 占满帧
-    - ``default=str``:工具结果可能含 datetime 之类非 JSON 原生类型,先兜底转字符串
-    - U+2028 / U+2029:被 ECMA-404 当作合法 JSON 字符,但 ECMA-262 之前把它们当
-      行终止符,某些老旧 SSE 中间件 / 浏览器会把帧从中切断 —— 显式转义
-    """
-    text = json.dumps(data, ensure_ascii=False, default=str)
-    return text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-
-
-@router.post("/converse")
-async def converse(req: ConverseRequest, request: Request) -> EventSourceResponse:
-    workspace_dir = request.app.state.workspace_dir
-    system_prompt = load_system_prompt(workspace_dir)
-    loop = _loop(request)
-
-    async def event_stream() -> AsyncIterator[dict[str, str]]:
-        try:
-            async for evt in loop.converse(
-                session_id=req.session_id,
-                user_content=req.content,
-                system_prompt=system_prompt,
-                channel=req.channel,
-                user_ref=req.user_ref,
-            ):
-                # 客户端断开时停止生成,放掉 LLM 网络 + DB 写盘成本
-                if await request.is_disconnected():
-                    logger.info(
-                        "client disconnected, aborting converse for session=%s",
-                        req.session_id,
-                    )
-                    break
-                yield {"event": evt["event"], "data": _sse_safe_dumps(evt["data"])}
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("converse loop failed")
-            yield {
-                "event": "error",
-                "data": _sse_safe_dumps(
-                    {"message": str(exc), "type": type(exc).__name__}
-                ),
-            }
-
-    return EventSourceResponse(event_stream())
-
-
-@router.get("/sessions/{session_id}/history", response_model=HistoryResponse)
-async def get_history(
-    session_id: str, request: Request, limit: int = 500
-) -> HistoryResponse:
-    """返回会话最近 ``limit`` 条 user/assistant 消息(按时间正序)。
-
-    默认 500 是给 Dashboard 首屏渲染用的"足够大"值;真实长会话超出后,旧消息
-    走 P7 向量召回。``limit`` 范围 [1, 5000],超出会被夹到边界,避免单次请求
-    把整张表 dump 到客户端。
-    """
-    # FastAPI 已校验 int 类型,但范围由我们自己卡 —— 否则调用方传 limit=-1
-    # 会被 SQLite 当无限,长会话立刻打回 P0 状态。
-    limit = max(1, min(limit, 5000))
-    store = _store(request)
-    rows = await store.history(session_id, limit=limit)
-    return HistoryResponse(
-        session_id=session_id,
-        messages=[
-            HistoryMessage(role=m.role, content=m.content, created_at=m.created_at)
-            for m in rows
-            if m.role in ("user", "assistant")
-        ],
-    )
-
-
-@router.get("/skills", response_model=SkillsResponse)
-async def list_skills(request: Request) -> SkillsResponse:
-    tools = _tools(request)
-    return SkillsResponse(
-        skills=[
-            SkillInfo(
-                name=t.name,
-                description=t.description,
-                input_schema=t.input_schema,
-                source=t.source,
-            )
-            for t in tools.all()
-        ]
-    )
-
-
-@router.get("/mcp/servers", response_model=MCPServersResponse)
-async def list_mcp_servers(request: Request) -> MCPServersResponse:
-    """已启动 / 失败 / 禁用的外部 MCP server 状态快照。"""
-    mcp_manager = getattr(request.app.state, "mcp_manager", None)
-    if mcp_manager is None:
-        return MCPServersResponse(servers=[])
-    return MCPServersResponse(
-        servers=[
-            MCPServerInfo(
-                name=s.name,
-                status=s.status,
-                disabled=s.disabled,
-                error=s.error,
-                tool_names=s.tool_names,
-                tools_count=s.tools_count,
-                started_at=s.started_at,
-                command=s.command,
-            )
-            for s in mcp_manager.states()
-        ]
-    )
+class SummariesResponse(BaseModel):
+    session_id: str
+    summaries: list[SummaryInfo]
 
 
 @router.get("/tasks", response_model=TasksResponse)
@@ -271,6 +141,30 @@ async def handle_fs_event(req: FsEventRequest, request: Request) -> FsEventRespo
         reloaded=True,
         tasks=[TaskInfo(name=t.name, cron=t.cron, on=t.on) for t in loaded.tasks],
         errors=[err.message for err in loaded.errors],
+    )
+
+
+@router.get("/sessions/{session_id}/summaries", response_model=SummariesResponse)
+async def get_summaries(session_id: str, request: Request) -> SummariesResponse:
+    """返回会话已生成的对话摘要列表(中期记忆)。"""
+    store = _store(request)
+    rows = await store.get_summaries(session_id, limit=10)
+    return SummariesResponse(
+        session_id=session_id,
+        summaries=[
+            SummaryInfo(
+                id=r["id"],
+                summary=r["summary"],
+                key_facts=r.get("key_facts", []),
+                decisions=r.get("decisions", []),
+                todos=r.get("todos", []),
+                message_start=r["message_start"],
+                message_end=r["message_end"],
+                importance=r.get("importance", 0.5),
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ],
     )
 
 

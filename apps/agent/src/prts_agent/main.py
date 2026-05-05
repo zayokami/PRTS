@@ -143,6 +143,23 @@ async def health() -> dict[str, object]:
     loaded = getattr(app.state, "skills_loaded", None)
     mcp_manager = getattr(app.state, "mcp_manager", None)
     mcp_states = mcp_manager.states() if mcp_manager else []
+
+    # P8: 上下文管理状态
+    context_mode = os.getenv("PRTS_CONTEXT_MODE", "smart")
+    summary_interval = int(os.getenv("PRTS_SUMMARY_INTERVAL", "10"))
+    agent_loop = getattr(app.state, "agent_loop", None)
+    budget_stats = {}
+    if agent_loop and hasattr(agent_loop, "_context_manager"):
+        cm = agent_loop._context_manager
+        budget_stats = {
+            "context_mode": context_mode,
+            "summary_interval": summary_interval,
+            "recent_window": cm._recent_window,
+            "vector_topk": cm._vector_topk,
+        }
+        if hasattr(cm, "_budget"):
+            budget_stats["budget"] = cm._budget.get_stats()
+
     return {
         "service": "prts-agent",
         "ok": True,
@@ -157,6 +174,7 @@ async def health() -> dict[str, object]:
         "mcp_servers": len(mcp_states),
         "mcp_servers_ready": sum(1 for s in mcp_states if s.status == "ready"),
         "mcp_servers_error": sum(1 for s in mcp_states if s.status == "error"),
+        "context": budget_stats,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
 
