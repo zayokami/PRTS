@@ -12,10 +12,9 @@
     async def morning_brief():
         ...
 
-P3:
 - ``@skill`` 把函数登记到模块级 registry,并把签名 introspect 成 JSON Schema,
   Agent 加载后通过 ToolRegistry 暴露给 LLM(tool calling)
-- ``@task`` 仍只登记;真正的 cron / 文件事件触发要等 P6 的 Rust watcher 接入
+- ``@task`` 登记定时/事件任务,由 prts-watcher 守护进程按 cron 表达式触发
 """
 
 from __future__ import annotations
@@ -170,8 +169,7 @@ def _build_input_schema(func: Callable[..., Any]) -> dict[str, Any]:
         schema["required"] = required
     # 不加 additionalProperties=False:OpenAI strict mode 会要求 required 覆盖所有字段,
     # 而 PRTS 允许默认参数(如 ping(message="...")),会和 strict 冲突。
-    # 当前 tool_choice="auto" 不开 strict,LLM 多传字段会被忽略;后期 P4 接 strict
-    # 工具时再针对性补 additionalProperties。
+    # tool_choice="auto" 不开 strict,LLM 多传字段会被忽略。
     return schema
 
 
@@ -215,7 +213,10 @@ def task(
     name: str | None = None,
     **extra: Any,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """注册一个定时 / 事件触发任务。MVP 仅登记,真正的触发等 P6。"""
+    """注册一个定时 / 事件触发任务。
+
+    由 prts-watcher 守护进程按 cron 表达式调度触发。
+    """
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         _tasks.append(

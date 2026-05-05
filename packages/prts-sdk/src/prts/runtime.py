@@ -26,7 +26,7 @@ class RuntimeBridge(Protocol):
         ...
 
     async def invoke_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        """调用任意工具(skill 或外部 MCP 工具,P4 起统一)。"""
+        """调用任意工具(skill 或外部 MCP 工具)。"""
         ...
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:

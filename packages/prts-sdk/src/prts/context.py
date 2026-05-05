@@ -44,8 +44,5 @@ def reset(token: Token[CallContext | None]) -> None:
 
 
 async def tool(name: str, **kwargs: Any) -> Any:
-    """跨工具调用:在 skill 内部触发其他 MCP 工具或 skill。
-
-    P3:同进程 ToolRegistry。P4:可路由到外部 MCP server。
-    """
+    """跨工具调用:在 skill 内部触发其他 MCP 工具或 skill。"""
     return await _runtime.get_runtime().invoke_tool(name, kwargs)

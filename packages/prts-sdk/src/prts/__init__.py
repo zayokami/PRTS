@@ -7,12 +7,12 @@ Agent 启动时 import 用户脚本之前会调 ``prts.runtime.set_runtime(bridg
 
 公开 API:
     prts.skill        装饰器,把函数注册成 LLM 可调用的工具
-    prts.task         装饰器,注册定时 / 事件触发任务(P6 起触发)
+    prts.task         装饰器,注册定时 / 事件触发任务
     prts.context      当前调用上下文 (session_id, user_id, history)
     prts.client       反向控制 Agent (notify / skill / chat)
     prts.llm          直接调底层 LLM(不进 Agent loop)
     prts.workspace    读写 workspace markdown
-    prts.memory       会话历史(P3) / 向量检索(P7)
+    prts.memory       会话历史 / 向量检索
     prts.runtime      Agent 注入桥接的内部模块,脚本一般不直接用
 """
 

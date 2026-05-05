@@ -1,7 +1,4 @@
-"""prts.memory —— 会话历史 / 向量检索。
-
-P3 接通 ``history()``;``search()`` / ``remember()`` 等向量 API 等 P7 sqlite-vec。
-"""
+"""prts.memory —— 会话历史 / 向量检索。"""
 
 from __future__ import annotations
 
