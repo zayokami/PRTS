@@ -84,6 +84,22 @@ class ToolRegistry:
             del self._tools[name]
         return len(victims)
 
+    def unregister_by_server(self, server_name: str) -> int:
+        """删除特定 MCP server 注册的工具(按 ``extra.server`` 匹配)。
+
+        MCP health check 重启单个 server 时,只清理该 server 的工具,
+        不影响其他仍在运行的 MCP server。
+        返回删除条数。
+        """
+        victims = [
+            name
+            for name, t in self._tools.items()
+            if t.source == "mcp" and t.extra.get("server") == server_name
+        ]
+        for name in victims:
+            del self._tools[name]
+        return len(victims)
+
     async def invoke(self, name: str, arguments: dict[str, Any]) -> Any:
         tool = self._tools.get(name)
         if tool is None:

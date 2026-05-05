@@ -171,6 +171,36 @@ async def reload_mcp_servers(request: Request) -> MCPReloadResponse:
     return MCPReloadResponse(ok=True, servers_ready=ready, servers_error=errors)
 
 
+class MCPHealthResponse(BaseModel):
+    ok: bool
+    results: dict[str, str] = {}
+    error: str | None = None
+
+
+@router.post("/mcp/health-check", response_model=MCPHealthResponse)
+async def health_check_mcp_servers(request: Request) -> MCPHealthResponse:
+    """健康检查:探测每个 MCP server 的连接是否仍然存活。
+
+    默认自动重启失败的 server;传 ``?auto_restart=false`` 可只检查不重启。
+    """
+    mcp_manager = getattr(request.app.state, "mcp_manager", None)
+    if mcp_manager is None:
+        return MCPHealthResponse(ok=False, error="mcp_manager not initialized")
+
+    auto_restart = request.query_params.get("auto_restart", "true").lower() != "false"
+
+    try:
+        results = await mcp_manager.health_check(auto_restart=auto_restart)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("mcp health check failed")
+        return MCPHealthResponse(
+            ok=False, error=f"{type(exc).__name__}: {exc}"
+        )
+
+    all_healthy = all(s == "healthy" or s == "disabled" for s in results.values())
+    return MCPHealthResponse(ok=all_healthy, results=results)
+
+
 @router.get("/tasks", response_model=TasksResponse)
 async def list_tasks(request: Request) -> TasksResponse:
     """返回当前已注册的 @task 列表,供 Rust watcher 获取 cron 调度信息。"""

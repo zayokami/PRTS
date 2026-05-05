@@ -140,6 +140,10 @@ class MCPManager:
         self._registry = registry
         self._parent_stack = parent_stack
         self._states: dict[str, MCPServerState] = {}
+        # P4+: 供 health check 与单 server 重启使用
+        self._sessions: dict[str, Any] = {}
+        self._stacks: dict[str, AsyncExitStack] = {}
+        self._configs: dict[str, MCPServerConfig] = {}
 
     def states(self) -> list[MCPServerState]:
         return list(self._states.values())
@@ -230,6 +234,9 @@ class MCPManager:
 
         self._parent_stack.push_async_callback(_close_child)
 
+        # 用于在 _bring_up 内部捕获 session 引用
+        _session_holder: list[Any] = []
+
         try:
             async def _bring_up() -> list[str]:
                 transport = await child_stack.enter_async_context(stdio_client(params))
@@ -237,6 +244,7 @@ class MCPManager:
                 session = await child_stack.enter_async_context(
                     ClientSession(read_stream, write_stream)
                 )
+                _session_holder.append(session)
                 await session.initialize()
                 tools_response = await session.list_tools()
                 return register_server_tools(
@@ -275,6 +283,12 @@ class MCPManager:
             # child_stack 已经登记了 close callback,parent_stack.aclose 时会兜底
             return
 
+        # 启动成功:保存引用供 health check / 单 server 重启使用
+        self._configs[name] = cfg
+        self._stacks[name] = child_stack
+        if _session_holder:
+            self._sessions[name] = _session_holder[0]
+
         self._states[name] = MCPServerState(
             name=name,
             status="ready",
@@ -306,7 +320,83 @@ class MCPManager:
         removed = self._registry.unregister_by_source("mcp")
         logger.info("MCP reload: removed %d existing tool(s)", removed)
         self._states.clear()
+        self._sessions.clear()
+        self._stacks.clear()
+        self._configs.clear()
         # 重新启动
         await self.start_all(config)
         ready = sum(1 for s in self.states() if s.status == "ready")
         logger.info("MCP reload: %d server(s) ready", ready)
+
+    async def health_check(self, *, auto_restart: bool = True) -> dict[str, str]:
+        """检查所有 server 健康状态。
+
+        对每个 ``ready`` 状态的 server,尝试调用 ``session.list_tools()`` 验证
+        连接是否仍然存活。如果失败则标记为 ``error`` 并(当 *auto_restart* 时)
+        尝试重新启动。
+
+        返回 ``{server_name: status}`` 映射,其中 status 取值:
+        ``healthy`` / ``unhealthy`` / ``disabled`` / ``restarting`` / ``error`` 。
+        """
+        results: dict[str, str] = {}
+        for name, state in list(self._states.items()):
+            if state.status == "disabled":
+                results[name] = "disabled"
+                continue
+
+            if state.status == "error":
+                if auto_restart and name in self._configs:
+                    await self._restart_one(name, self._configs[name])
+                    results[name] = "restarting"
+                else:
+                    results[name] = "error"
+                continue
+
+            session = self._sessions.get(name)
+            if session is None:
+                results[name] = "unhealthy"
+                await self._mark_dead(name, "session missing")
+                if auto_restart and name in self._configs:
+                    await self._restart_one(name, self._configs[name])
+                    results[name] = "restarting"
+                continue
+
+            try:
+                await asyncio.wait_for(session.list_tools(), timeout=5.0)
+                results[name] = "healthy"
+            except Exception as exc:
+                logger.warning("MCP server %r health check failed: %s", name, exc)
+                results[name] = "unhealthy"
+                await self._mark_dead(name, f"health check failed: {exc}")
+                if auto_restart and name in self._configs:
+                    await self._restart_one(name, self._configs[name])
+                    results[name] = "restarting"
+
+        return results
+
+    async def _mark_dead(self, name: str, error: str) -> None:
+        """标记 server 为死亡状态并清理引用(但不关闭 stack,留给 _restart_one)。"""
+        state = self._states.get(name)
+        if state is not None:
+            self._states[name] = MCPServerState(
+                name=name,
+                status="error",
+                error=error,
+                command=state.command,
+            )
+        self._sessions.pop(name, None)
+        self._registry.unregister_by_server(name)
+
+    async def _restart_one(self, name: str, cfg: MCPServerConfig) -> None:
+        """重启单个 server(关闭旧 stack 后重新 _start_one)。"""
+        logger.info("MCP server %r auto-restarting...", name)
+        old_stack = self._stacks.pop(name, None)
+        if old_stack is not None:
+            try:
+                await old_stack.aclose()
+            except Exception:
+                pass
+        self._states.pop(name, None)
+        self._sessions.pop(name, None)
+        self._registry.unregister_by_server(name)
+        await self._start_one(name, cfg)

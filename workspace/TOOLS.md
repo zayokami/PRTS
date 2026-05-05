@@ -24,6 +24,8 @@ P4 阶段:Agent 启动时读取 `workspace/mcp.json`,把声明的每个 MCP serv
 
 **热重载**:`POST /agent/v1/mcp/reload`(经 gateway 是 `POST /mcp/reload`),停止所有现有 MCP server,重新加载 `workspace/mcp.json` 并启动。改配置后无需重启 Agent。
 
+**健康检查**:`POST /agent/v1/mcp/health-check`(经 gateway 是 `POST /mcp/health-check`),探测每个 MCP server 的连接是否仍然存活。默认自动重启失败的 server;传 `?auto_restart=false` 可只检查不重启。返回每个 server 的 `healthy` / `unhealthy` / `restarting` / `disabled` / `error` 状态。
+
 **已知 server**:
 
 - `filesystem` —— 官方 [`@modelcontextprotocol/server-filesystem`](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem),读写本地文件(限制在传入的目录内)。seed 默认指向 `${WORKSPACE_DIR}`。
