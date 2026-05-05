@@ -28,6 +28,19 @@ class ChatMessage(TypedDict, total=False):
 
 
 @dataclass
+class TokenUsage:
+    """LLM 响应中的 token 消耗统计。
+
+    P8: 用于校准本地 heuristic token 计数,让上下文预算更精准。
+    """
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    model: str
+
+
+@dataclass
 class TextEvent:
     type: Literal["text"]
     delta: str
@@ -42,20 +55,37 @@ class ToolCallEvent:
 
 
 @dataclass
+class UsageEvent:
+    """流式响应中携带的 token 消耗事件。
+
+    不同 provider 在 stream 的不同位置提供 usage:
+    - OpenAI: 部分 provider 在最后一个 chunk 或 choices[0].usage
+    - Anthropic: 在 message_stop 事件
+    """
+
+    type: Literal["usage"]
+    usage: TokenUsage
+
+
+@dataclass
 class EndEvent:
     type: Literal["end"]
     stop_reason: str  # "stop" | "tool_use" | "length" | "error" | ...
     raw_assistant_message: dict[str, Any] = field(default_factory=dict)
 
 
-StreamEvent = Union[TextEvent, ToolCallEvent, EndEvent]
+StreamEvent = Union[TextEvent, ToolCallEvent, UsageEvent, EndEvent]
 
 
 class LlmClient(ABC):
     """LLM 客户端抽象接口。
 
     子类必须暴露 ``model`` (只读) 供上层做 token 预算管理。
+    P8 起支持 ``last_usage`` 读取上一次调用的实际 token 消耗。
     """
+
+    def __init__(self) -> None:
+        self._last_usage: TokenUsage | None = None
 
     @property
     @abstractmethod
@@ -69,6 +99,14 @@ class LlmClient(ABC):
         from .tokenizer import get_context_limit
 
         return get_context_limit(self.model)
+
+    @property
+    def last_usage(self) -> TokenUsage | None:
+        """上一次 ``stream_chat`` 的实际 token 消耗。
+
+        仅在流正常结束后有效;如果流中途取消或未发 UsageEvent,可能为 None。
+        """
+        return self._last_usage
 
     @abstractmethod
     def stream_chat(
@@ -84,7 +122,7 @@ class LlmClient(ABC):
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
     ) -> str:
-        """便利方法:聚合 ``stream_chat`` 的所有文本,忽略工具调用。"""
+        """便利方法:聚合 ``stream_chat`` 的所有文本,忽略工具调用和 usage 事件。"""
         buf: list[str] = []
         async for evt in self.stream_chat(messages, tools=tools):
             if isinstance(evt, TextEvent):

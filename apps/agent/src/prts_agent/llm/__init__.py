@@ -16,7 +16,9 @@ from .base import (
     LlmClient,
     StreamEvent,
     TextEvent,
+    TokenUsage,
     ToolCallEvent,
+    UsageEvent,
 )
 from .openai_client import OpenAILlmClient
 
@@ -41,6 +43,8 @@ __all__ = [
     "LlmClient",
     "StreamEvent",
     "TextEvent",
+    "TokenUsage",
     "ToolCallEvent",
+    "UsageEvent",
     "build_llm_client",
 ]

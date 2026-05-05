@@ -21,7 +21,16 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 
-from .base import ChatMessage, EndEvent, LlmClient, StreamEvent, TextEvent, ToolCallEvent
+from .base import (
+    ChatMessage,
+    EndEvent,
+    LlmClient,
+    StreamEvent,
+    TextEvent,
+    TokenUsage,
+    ToolCallEvent,
+    UsageEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +206,20 @@ class AnthropicLlmClient(LlmClient):
                     sr = getattr(event.delta, "stop_reason", None)
                     if sr:
                         stop_reason = sr
+
+                elif etype == "message_stop":
+                    # P8: Anthropic 在 message_stop 时提供 usage
+                    usage = getattr(event, "usage", None)
+                    if usage:
+                        input_tokens = getattr(usage, "input_tokens", 0)
+                        output_tokens = getattr(usage, "output_tokens", 0)
+                        self._last_usage = TokenUsage(
+                            prompt_tokens=input_tokens,
+                            completion_tokens=output_tokens,
+                            total_tokens=input_tokens + output_tokens,
+                            model=self._model,
+                        )
+                        yield UsageEvent(type="usage", usage=self._last_usage)
 
         # 构造原样 assistant 消息(OpenAI 风格,便于 history 回写)
         assistant_msg: dict[str, Any] = {

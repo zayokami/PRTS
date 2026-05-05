@@ -14,7 +14,16 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from .base import ChatMessage, EndEvent, LlmClient, StreamEvent, TextEvent, ToolCallEvent
+from .base import (
+    ChatMessage,
+    EndEvent,
+    LlmClient,
+    StreamEvent,
+    TextEvent,
+    TokenUsage,
+    ToolCallEvent,
+    UsageEvent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +60,27 @@ class OpenAILlmClient(LlmClient):
         finish_reason: str | None = None
 
         async for chunk in stream:
+            # P8: 解析 usage —— 不同 provider 位置不同:
+            # - 标准 OpenAI: chunk.usage (最后一个 chunk)
+            # - Groq: chunk.x_groq.usage
+            # - 某些代理: chunk.choices[0].usage
+            usage = getattr(chunk, "usage", None)
+            if usage is None and chunk.choices:
+                usage = getattr(chunk.choices[0], "usage", None)
+            if usage is None:
+                # Groq 等特殊 provider
+                usage = getattr(getattr(chunk, "x_groq", None), "usage", None)
+
+            if usage and usage.prompt_tokens is not None:
+                self._last_usage = TokenUsage(
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens or 0,
+                    total_tokens=usage.total_tokens
+                    or (usage.prompt_tokens + (usage.completion_tokens or 0)),
+                    model=self._model,
+                )
+                yield UsageEvent(type="usage", usage=self._last_usage)
+
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]

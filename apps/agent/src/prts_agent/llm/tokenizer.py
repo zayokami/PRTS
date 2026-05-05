@@ -15,6 +15,7 @@ Heuristic rationale
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -322,3 +323,124 @@ def count_messages_tokens(messages: list[dict]) -> int:
     if not messages:
         return 0
     return sum(count_message_tokens(m) for m in messages) + 2  # list brackets
+
+
+# ---------------------------------------------------------------------------
+# P8: 结合模型自报告校准 heuristic 计数
+# ---------------------------------------------------------------------------
+
+# 记录最近 N 次 heuristic vs actual 的误差比例,用于渐进校准。
+# key: model_name, value: deque of (heuristic, actual) 比例
+_calibration_history: dict[str, collections.deque[tuple[int, int]]] = {}
+_MAX_CALIBRATION_HISTORY = 20
+
+
+def record_usage_discrepancy(model: str, heuristic_tokens: int, actual_tokens: int) -> None:
+    """记录一次 heuristic 计数与模型自报告的偏差。
+
+    用于后续 ``estimate_prompt_tokens`` 的动态校准。只在实际 usage
+    与 heuristic 差异显著(>5%)时记录,避免噪声。
+    """
+    if heuristic_tokens <= 0 or actual_tokens <= 0:
+        return
+    ratio = actual_tokens / heuristic_tokens
+    # 忽略极端异常值(可能是不同计数方式)
+    if not (0.3 <= ratio <= 3.0):
+        return
+
+    import collections
+
+    if model not in _calibration_history:
+        _calibration_history[model] = collections.deque(maxlen=_MAX_CALIBRATION_HISTORY)
+    _calibration_history[model].append((heuristic_tokens, actual_tokens))
+
+
+def get_calibration_ratio(model: str) -> float | None:
+    """返回该模型最近 heuristic / actual 的平均比例。
+
+    None 表示尚无足够数据(至少 3 条记录)。
+    """
+    history = _calibration_history.get(model)
+    if not history or len(history) < 3:
+        return None
+    total_heuristic = sum(h for h, _ in history)
+    total_actual = sum(a for _, a in history)
+    if total_heuristic == 0:
+        return None
+    return total_actual / total_heuristic
+
+
+def estimate_prompt_tokens(
+    messages: list[dict],
+    *,
+    actual_usage: "TokenUsage | None" = None,
+) -> int:
+    """估算 prompt token 数,优先使用模型自报告校准。
+
+    参数:
+        messages: 要发送给 LLM 的消息数组
+        actual_usage: 上一轮的实际 usage(如果有)。用于校准 heuristic。
+
+    返回:
+        建议的 prompt token 估算值。如果提供了 actual_usage,
+        用实际 prompt_tokens 替换 heuristic 的 system+history 部分;
+        否则用保守 heuristic。
+    """
+    heuristic = count_messages_tokens(messages)
+
+    if actual_usage is None:
+        return heuristic
+
+    # 有实际 usage:记录偏差用于未来校准
+    record_usage_discrepancy(actual_usage.model, heuristic, actual_usage.prompt_tokens)
+
+    # 返回实际值(更准),但如果 actual 异常小(可能是流未结束),fallback
+    if actual_usage.prompt_tokens >= heuristic * 0.5:
+        # 用实际 prompt_tokens,但保留 completion 的 heuristic 占位
+        # (completion 无法预知,取决于模型输出长度)
+        return actual_usage.prompt_tokens
+
+    return heuristic
+
+
+def get_suggested_headroom(
+    model: str,
+    recent_usages: list["TokenUsage"],
+    tool_heavy_threshold: float = 0.30,
+) -> float:
+    """根据最近 usage 模式建议 headroom 比例。
+
+    P8 动态预算:如果历史记录显示 tool 结果占了大量 prompt tokens,
+    说明这是 tool 密集场景,应预留更多空间给输出。
+
+    参数:
+        model: 当前模型名
+        recent_usages: 最近 N 轮对话的 usage
+        tool_heavy_threshold: 判定为"tool 密集"的阈值
+            (tool_result 占总 prompt 的比例)
+
+    返回:
+        建议的 headroom(0.0-1.0)。默认 0.80。
+    """
+    if not recent_usages:
+        return 0.80
+
+    # 估算 tool 开销比例:看 usage 增长趋势
+    # 简化:如果最近 usage 的 prompt_tokens 持续增长,说明 history 膨胀快
+    prompt_tokens = [u.prompt_tokens for u in recent_usages if u.prompt_tokens > 0]
+    if len(prompt_tokens) < 3:
+        return 0.80
+
+    # 计算最近 3 轮的平均增长
+    recent_growth = (
+        prompt_tokens[-1] - prompt_tokens[-3]
+    ) / max(prompt_tokens[-3], 1)
+
+    if recent_growth > tool_heavy_threshold:
+        # 快速增长:tool 密集,留更多 headroom
+        return 0.65
+    elif recent_growth > tool_heavy_threshold / 2:
+        return 0.75
+
+    # 平稳或慢增长:可以激进一点
+    return 0.85
