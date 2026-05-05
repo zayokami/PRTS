@@ -51,6 +51,7 @@ class ContextManager:
         summarizer: DialogueSummarizer,
         budget: DynamicBudget,
         embedding: EmbeddingClient | None = None,
+        tools: "ToolRegistry | None" = None,
         *,
         recent_window: int = DEFAULT_RECENT_WINDOW,
         summary_interval: int = DEFAULT_SUMMARY_INTERVAL,
@@ -61,6 +62,7 @@ class ContextManager:
         self._summarizer = summarizer
         self._budget = budget
         self._embedding = embedding
+        self._tools = tools
         self._recent_window = recent_window
         self._summary_interval = summary_interval
         self._vector_topk = vector_topk
@@ -162,16 +164,12 @@ class ContextManager:
 
         通过 prts-vector__search 工具查询与当前问题语义相近的历史记录。
         """
-        if self._embedding is None:
+        if self._embedding is None or self._tools is None:
             return []
 
         try:
             vec = await self._embedding.embed(user_content)
-            # 通过 ToolRegistry 调用 prts-vector MCP server
-            from ..tools import ToolRegistry
-
-            tools = ToolRegistry()
-            raw = await tools.invoke(
+            raw = await self._tools.invoke(
                 "prts-vector__search",
                 {"query_vector": vec, "top_k": self._vector_topk},
             )

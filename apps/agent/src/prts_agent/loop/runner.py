@@ -187,6 +187,7 @@ class AgentLoop:
             summarizer=self._summarizer,
             budget=self._budget,
             embedding=embedding_client,
+            tools=tools,
         )
 
     async def converse(

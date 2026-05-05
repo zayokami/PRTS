@@ -25,7 +25,11 @@ P4 阶段:Agent 启动时读取 `workspace/mcp.json`,把声明的每个 MCP serv
 **已知 server**:
 
 - `filesystem` —— 官方 [`@modelcontextprotocol/server-filesystem`](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem),读写本地文件(限制在传入的目录内)。seed 默认指向 `${WORKSPACE_DIR}`。
-- `prts-vector` —— 自研向量检索 MCP server,基于 sqlite-vec。提供 `prts-vector__upsert`(写入向量)和 `prts-vector__search`(L2 最近邻搜索)两个工具。seed 默认 `disabled: true`,启用前需要把 `prts-vector` binary 加入 PATH(或 `cargo build --bin prts-vector` 后用绝对路径)。
+- `prts-vector` —— 自研向量检索 MCP server,基于 sqlite-vec。提供 `prts-vector__upsert`(写入向量)和 `prts-vector__search`(L2 最近邻搜索)两个工具。
+  - **编译**: `cargo build --bin prts-vector`
+  - **启用**: 把 `workspace/mcp.json` 中 `prts-vector.disabled` 改为 `false`,并确保 `command` 指向 binary(已编译时可直接用 `prts-vector`,或用绝对路径 `target/debug/prts-vector`)
+  - **维度**: 默认 1536(对应 OpenAI text-embedding-3-small),可在 `args` 中改 `--dim`
+  - **数据库**: 默认 `${WORKSPACE_DIR}/vector.db`,自动创建
 - `prts-workspace` —— 自研 Workspace MCP server,暴露 `~/.prts/workspace/*.md` 给 MCP client。提供 `prts-workspace__list_documents`(列文档)、`prts-workspace__read_document`(读文档)、`prts-workspace__write_document`(写文档)和 `prts-workspace__search_documents`(搜索文档)四个工具。安装方式:已在 uv workspace 中,执行 `uv sync --all-packages` 后 `prts-workspace` 命令即加入 PATH。seed 默认 `disabled: true`。
 
 ## P8 —— 长上下文管理与记忆管理

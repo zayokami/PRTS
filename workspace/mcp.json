@@ -17,7 +17,8 @@
         "--dim",
         "1536"
       ],
-      "disabled": true
+      "disabled": true,
+      "_note": "启用前需要 cargo build --bin prts-vector 并把 target/debug/prts-vector 加入 PATH，或写绝对路径"
     },
     "prts-workspace": {
       "command": "prts-workspace",
