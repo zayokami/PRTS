@@ -57,6 +57,21 @@ CREATE TABLE IF NOT EXISTS events (
     payload     TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
+-- P8: 中期记忆层 —— 对话摘要
+CREATE TABLE IF NOT EXISTS summaries (
+    id              TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL REFERENCES sessions(id),
+    summary         TEXT NOT NULL,
+    key_facts       TEXT,
+    decisions       TEXT,
+    todos           TEXT,
+    message_start   INTEGER NOT NULL,
+    message_end     INTEGER NOT NULL,
+    importance      REAL DEFAULT 0.5,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id, message_end);
+CREATE INDEX IF NOT EXISTS idx_summaries_importance ON summaries(session_id, importance DESC);
 """
 
 # 连接级 PRAGMA。WAL 让读写能并行,busy_timeout 让另一个进程在写锁时等而非
@@ -223,6 +238,124 @@ class SqliteStore:
             meta = json.loads(meta_text) if meta_text else {}
             out.append(StoredMessage(role=role, content=content, created_at=created_at, meta=meta))
         return out
+
+    # ---------- P8: 中期记忆层 (summaries) ---------- #
+
+    async def save_summary(
+        self,
+        session_id: str,
+        summary_id: str,
+        summary: str,
+        message_start: int,
+        message_end: int,
+        *,
+        key_facts: list[str] | None = None,
+        decisions: list[str] | None = None,
+        todos: list[str] | None = None,
+        importance: float = 0.5,
+    ) -> None:
+        """保存一条对话摘要。"""
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            await conn.execute(
+                """
+                INSERT INTO summaries
+                (id, session_id, summary, key_facts, decisions, todos,
+                 message_start, message_end, importance, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    summary_id,
+                    session_id,
+                    summary,
+                    json.dumps(key_facts or [], ensure_ascii=False),
+                    json.dumps(decisions or [], ensure_ascii=False),
+                    json.dumps(todos or [], ensure_ascii=False),
+                    message_start,
+                    message_end,
+                    importance,
+                    _now(),
+                ),
+            )
+            await conn.commit()
+
+    async def get_summaries(
+        self,
+        session_id: str,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """获取会话的摘要列表,按重要性降序,最近优先。"""
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            cursor = await conn.execute(
+                """
+                SELECT id, summary, key_facts, decisions, todos,
+                       message_start, message_end, importance, created_at
+                FROM summaries
+                WHERE session_id = ?
+                ORDER BY importance DESC, message_end DESC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            )
+            rows = await cursor.fetchall()
+
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append({
+                "id": row[0],
+                "summary": row[1],
+                "key_facts": json.loads(row[2]) if row[2] else [],
+                "decisions": json.loads(row[3]) if row[3] else [],
+                "todos": json.loads(row[4]) if row[4] else [],
+                "message_start": row[5],
+                "message_end": row[6],
+                "importance": row[7],
+                "created_at": row[8],
+            })
+        return out
+
+    async def get_last_summary_end(self, session_id: str) -> int:
+        """返回该会话最新摘要覆盖的 message_end。没有则返回 0。"""
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            cursor = await conn.execute(
+                """
+                SELECT MAX(message_end) FROM summaries
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+        return row[0] or 0
+
+    async def delete_old_summaries(
+        self,
+        session_id: str,
+        keep: int = 10,
+    ) -> int:
+        """清理该会话的旧摘要,只保留最近 N 条。返回删除条数。"""
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            # 先查要删的 ID
+            cursor = await conn.execute(
+                """
+                SELECT id FROM summaries
+                WHERE session_id = ?
+                ORDER BY message_end DESC
+                LIMIT -1 OFFSET ?
+                """,
+                (session_id, keep),
+            )
+            to_delete = [r[0] for r in await cursor.fetchall()]
+            if to_delete:
+                placeholders = ",".join("?" * len(to_delete))
+                await conn.execute(
+                    f"DELETE FROM summaries WHERE id IN ({placeholders})",
+                    to_delete,
+                )
+                await conn.commit()
+            return len(to_delete)
 
 
 def init_store(workspace_dir: Path | None = None) -> SqliteStore:
