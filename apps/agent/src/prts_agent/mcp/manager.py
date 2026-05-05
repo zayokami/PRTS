@@ -287,3 +287,26 @@ class MCPManager:
             name,
             len(tool_names),
         )
+
+    async def reload(self, config: MCPConfig) -> None:
+        """热重载:停止所有现有 server,重新启动。
+
+        步骤:
+        1. 关闭所有现有 server 的子进程
+        2. 从 registry 中移除 source="mcp" 的工具
+        3. 重新加载配置并启动
+        """
+        logger.info("MCP reload: stopping %d existing server(s)", len(self._states))
+        # 关闭所有子 stack(会杀掉子进程)
+        await self._parent_stack.aclose()
+        # 重新进入 aenter,为新一轮 server 做准备
+        self._parent_stack = AsyncExitStack()
+        await self._parent_stack.__aenter__()
+        # 从 registry 中清理 MCP 工具
+        removed = self._registry.unregister_by_source("mcp")
+        logger.info("MCP reload: removed %d existing tool(s)", removed)
+        self._states.clear()
+        # 重新启动
+        await self.start_all(config)
+        ready = sum(1 for s in self.states() if s.status == "ready")
+        logger.info("MCP reload: %d server(s) ready", ready)

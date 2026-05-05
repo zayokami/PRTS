@@ -22,6 +22,8 @@ P4 阶段:Agent 启动时读取 `workspace/mcp.json`,把声明的每个 MCP serv
 
 **看状态**:`GET /agent/v1/mcp/servers`(经 gateway 是 `GET /mcp/servers`),返回每个 server 的 `status`(`ready` / `error` / `disabled`)、报错信息、注册到 registry 的工具名列表。
 
+**热重载**:`POST /agent/v1/mcp/reload`(经 gateway 是 `POST /mcp/reload`),停止所有现有 MCP server,重新加载 `workspace/mcp.json` 并启动。改配置后无需重启 Agent。
+
 **已知 server**:
 
 - `filesystem` —— 官方 [`@modelcontextprotocol/server-filesystem`](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem),读写本地文件(限制在传入的目录内)。seed 默认指向 `${WORKSPACE_DIR}`。

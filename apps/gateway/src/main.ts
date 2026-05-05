@@ -42,6 +42,12 @@ app.get("/mcp/servers", async (_req, reply) => {
   reply.code(resp.status).type("application/json").send(await resp.text());
 });
 
+// 透传到 agent: POST /agent/v1/mcp/reload
+app.post("/mcp/reload", async (_req, reply) => {
+  const resp = await fetch(`${AGENT_URL}/agent/v1/mcp/reload`, { method: "POST" });
+  reply.code(resp.status).type("application/json").send(await resp.text());
+});
+
 interface InboundUserFrame {
   type: "user";
   content: string;
