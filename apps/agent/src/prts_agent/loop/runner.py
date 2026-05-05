@@ -39,32 +39,32 @@ from ..llm import (
     LlmClient,
     TextEvent,
     ToolCallEvent,
+    UsageEvent,
 )
 from ..llm.anthropic_client import AnthropicLlmClient
 from ..llm.embedding import EmbeddingClient
 from ..llm.tokenizer import count_messages_tokens
 from ..memory import SqliteStore
 from ..memory.sqlite import PendingMessage
+from ..memory.summarizer import DialogueSummarizer
 from ..runtime import bind_notify_queue, unbind_notify_queue
 from ..tools import ToolRegistry
+
+from .budget import DynamicBudget
+from .context_manager import ContextManager
 
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 8
-# 短期即时上下文条数。向量检索负责召回跨时间/跨 session 的相关历史,
-# 这里只保留最近 N 条保证多轮工具调用的连贯性。
-RECENT_WINDOW = 20
-VECTOR_TOPK = 5
-# 单个 tool 结果最大字符数 ≈ 4k token。超过会截断,避免一次 ``filesystem__read_text_file``
-# 把整篇大文件灌进 history,后续每轮都重发一遍把 prompt cache 顶飞 + 吃光上下文。
-# 截断标记里告诉 LLM 完整大小,必要时它能用更窄的参数(行号区间、关键词)重调。
 MAX_TOOL_RESULT_CHARS = 16000
 
-# Token 预算:只用上下文窗口的 80%,留 20% headroom 给输出 + 安全余量。
-# 自研 count_tokens 是保守估计,headroom 还能抵消计数误差。
-TOKEN_HEADROOM = 0.80
-# 截断时至少保留的对话轮次 (user+assistant = 1 轮)
-MIN_RECENT_PAIRS = 4
+# --- P8 DEPRECATED: 以下常量已被 ContextManager 接管,保留仅向后兼容 ---
+# RECENT_WINDOW, VECTOR_TOPK, TOKEN_HEADROOM, MIN_RECENT_PAIRS
+# 现在通过 PRTS_CONTEXT_MODE / ContextManager 参数控制。
+# RECENT_WINDOW = 20  # 见 context_manager.DEFAULT_RECENT_WINDOW
+# VECTOR_TOPK = 5     # 见 context_manager.DEFAULT_VECTOR_TOPK
+# TOKEN_HEADROOM = 0.80  # 见 budget.DynamicBudget
+# MIN_RECENT_PAIRS = 4   # 见 context_manager.MIN_RECENT_PAIRS
 
 
 def _stored_to_chat(messages: list) -> list[ChatMessage]:
@@ -178,6 +178,17 @@ class AgentLoop:
         self._tools = tools
         self._embedding = embedding_client
 
+        # P8: 初始化三层记忆组件
+        self._budget = DynamicBudget(llm)
+        self._summarizer = DialogueSummarizer(llm)
+        self._context_manager = ContextManager(
+            store=store,
+            llm=llm,
+            summarizer=self._summarizer,
+            budget=self._budget,
+            embedding=embedding_client,
+        )
+
     async def converse(
         self,
         session_id: str,
@@ -210,7 +221,8 @@ class AgentLoop:
 
         try:
             for iteration in range(MAX_ITERATIONS):
-                messages = await self._build_messages(
+                # P8: 使用 ContextManager 组装三层记忆上下文
+                messages = await self._context_manager.build_context(
                     session_id, user_content, system_prompt
                 )
 
@@ -238,6 +250,14 @@ class AgentLoop:
                         elif isinstance(evt, ToolCallEvent):
                             pending_calls.append(
                                 {"id": evt.id, "name": evt.name, "arguments": evt.arguments}
+                            )
+                        elif isinstance(evt, UsageEvent):
+                            # P8: 记录 usage 用于动态预算校准
+                            self._budget.record(evt.usage)
+                            logger.debug(
+                                "usage recorded: prompt=%d completion=%d",
+                                evt.usage.prompt_tokens,
+                                evt.usage.completion_tokens,
                             )
                         elif isinstance(evt, EndEvent):
                             end_evt = evt
@@ -371,144 +391,6 @@ class AgentLoop:
         finally:
             unbind_notify_queue(nq_token)
             prts_reset(ctx_token)
-
-    async def _build_messages(
-        self,
-        session_id: str,
-        user_content: str,
-        system_prompt: str,
-    ) -> list[ChatMessage]:
-        """混合上下文构造: 最近 N 条保证连贯 + 向量召回跨时空相关历史。
-
-        构造完成后会做一次 token 预算检查。若超出 ``context_limit * TOKEN_HEADROOM``
-        则按以下优先级丢弃内容,直到落回预算内:
-
-        1. 去掉 system prompt 中的向量召回段落(可选内容)。
-        2. 从 oldest chat 消息开始丢弃,至少保留 ``MIN_RECENT_PAIRS`` 轮对话。
-        """
-        recent = await self._store.history(session_id, limit=RECENT_WINDOW)
-        budget = int(self._llm.context_limit * TOKEN_HEADROOM)
-
-        # ---- 向量召回(可选) ----
-        recalled_texts: list[str] = []
-        if self._embedding is not None:
-            try:
-                vec = await self._embedding.embed(user_content)
-                raw = await self._tools.invoke(
-                    "prts-vector__search",
-                    {"query_vector": vec, "top_k": VECTOR_TOPK},
-                )
-                if isinstance(raw, str):
-                    raw = json.loads(raw)
-                if isinstance(raw, dict) and raw.get("ok"):
-                    for r in raw.get("results", []):
-                        payload_str = r.get("payload")
-                        if payload_str:
-                            try:
-                                payload = json.loads(payload_str)
-                                text = payload.get("text", "")
-                            except (TypeError, ValueError):
-                                text = payload_str
-                            if text:
-                                recalled_texts.append(text)
-            except Exception:
-                logger.exception("vector recall failed")
-
-        # ---- 组装 system prompt ----
-        system_parts: list[str] = []
-        if system_prompt:
-            system_parts.append(system_prompt)
-        if recalled_texts:
-            seen: set[str] = set()
-            unique_lines: list[str] = []
-            for t in recalled_texts:
-                if t not in seen:
-                    seen.add(t)
-                    unique_lines.append(t)
-            system_parts.append(
-                "以下是与当前问题相关的历史回忆:\n"
-                + "\n".join(f"- {line}" for line in unique_lines)
-            )
-
-        full_system = "\n\n".join(system_parts)
-        chat_history = _stored_to_chat(recent)
-
-        messages: list[ChatMessage] = []
-        if full_system:
-            messages.append({"role": "system", "content": full_system})
-        messages.extend(chat_history)
-
-        # ---- token 预算检查与截断 ----
-        total = count_messages_tokens(messages)
-        if total > budget:
-            logger.warning(
-                "messages token count %d > budget %d (limit=%d * %.0f%%), truncating",
-                total,
-                budget,
-                self._llm.context_limit,
-                TOKEN_HEADROOM * 100,
-            )
-            messages = self._truncate_messages_to_budget(
-                messages,
-                budget,
-                base_system=system_prompt,
-            )
-            new_total = count_messages_tokens(messages)
-            logger.info(
-                "truncated from %d to %d tokens (%d messages retained)",
-                total,
-                new_total,
-                len(messages),
-            )
-
-        return messages
-
-    def _truncate_messages_to_budget(
-        self,
-        messages: list[ChatMessage],
-        budget: int,
-        base_system: str,
-    ) -> list[ChatMessage]:
-        """逐步截断消息列表,直到 token 数 ≤ budget。"""
-        # 分离 system 与对话消息
-        system_msgs = [m for m in messages if m.get("role") == "system"]
-        chat_msgs = [m for m in messages if m.get("role") != "system"]
-
-        # 提前准备好 "精简版 system"(不含召回段落),供后续步骤复用
-        trimmed_system: list[ChatMessage] = []
-        if base_system:
-            trimmed_system = [{"role": "system", "content": base_system}]
-
-        # 步骤 1: 尝试去掉 system 中的召回段落,只保留 base_system
-        if system_msgs and trimmed_system:
-            candidate = trimmed_system + chat_msgs
-            if count_messages_tokens(candidate) <= budget:
-                return candidate
-
-        # 步骤 2: 从 oldest 开始丢弃 chat 消息
-        # 1 轮对话 = user + assistant (2 条); tool 消息也算在内。
-        # 为了简单且安全,直接按条数丢弃,至少保留 MIN_RECENT_PAIRS*2 条。
-        min_keep = MIN_RECENT_PAIRS * 2
-        base_system_msgs = trimmed_system if trimmed_system else system_msgs
-        for drop in range(max(0, len(chat_msgs) - min_keep + 1)):
-            kept = chat_msgs[drop:]
-            candidate = base_system_msgs + kept
-            if count_messages_tokens(candidate) <= budget:
-                return candidate
-
-        # 步骤 3: 即使只剩最小集合也超预算 —— 强行只保留 system + 最近 1 轮
-        # (2 条 chat)。这种情况通常意味着单条消息极长或 system prompt 本身超预算。
-        fallback = base_system_msgs + chat_msgs[-2:]
-        if len(chat_msgs) >= 2 and count_messages_tokens(fallback) <= budget:
-            return fallback
-
-        # 步骤 4: 最后的最后 —— 只保留 system prompt(让 LLM 至少知道角色)。
-        last_ditch = base_system_msgs
-        logger.warning(
-            "severe context overflow: only system prompt kept (%d tokens)",
-            count_messages_tokens(last_ditch),
-        )
-        return last_ditch
 
     async def _auto_remember(
         self,
