@@ -43,7 +43,7 @@ from ..llm import (
 )
 from ..llm.anthropic_client import AnthropicLlmClient
 from ..llm.embedding import EmbeddingClient
-from ..llm.tokenizer import count_messages_tokens
+from ..llm.tokenizer import count_messages_tokens, set_calibration_store
 from ..memory import SqliteStore
 from ..memory.sqlite import PendingMessage
 from ..memory.summarizer import DialogueSummarizer
@@ -219,8 +219,12 @@ class AgentLoop:
         # 2. 审计日志
         self._hooks.register_post(_log_tool_execution)
 
+        # P9: 初始化 tokenizer 校准持久化
+        set_calibration_store(store)
+
         # P8: 初始化三层记忆组件
-        self._budget = DynamicBudget(llm)
+        # P9: DynamicBudget 注入 store 以持久化历史
+        self._budget = DynamicBudget(llm, store=store)
         self._summarizer = DialogueSummarizer(llm)
         self._context_manager = ContextManager(
             store=store,

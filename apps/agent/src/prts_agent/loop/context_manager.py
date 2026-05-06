@@ -12,8 +12,11 @@ P8 核心组件:统筹短期上下文(最近消息)、中期记忆(摘要)、长
 
 from __future__ import annotations
 
+import collections
+import hashlib
 import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -44,6 +47,13 @@ _SUMMARY_INTERVAL = int(os.getenv("PRTS_SUMMARY_INTERVAL", str(DEFAULT_SUMMARY_I
 class ContextManager:
     """三层记忆上下文组装器。"""
 
+    # 向量召回结果缓存 (P1): query_text → recalled_results, TTL 5min
+    _VECTOR_RECALL_TTL = 300  # 5 分钟
+    _VECTOR_RECALL_MAX = 200
+    # 上下文组装缓存 (P1): build_context 结果缓存, TTL 10s
+    _CONTEXT_CACHE_TTL = 10  # 10 秒
+    _CONTEXT_CACHE_MAX = 50
+
     def __init__(
         self,
         store: SqliteStore,
@@ -66,6 +76,18 @@ class ContextManager:
         self._recent_window = recent_window
         self._summary_interval = summary_interval
         self._vector_topk = vector_topk
+        # 向量召回结果缓存: key=hash(session_id+query), value=(results, expire_at)
+        self._recall_cache: collections.OrderedDict[str, tuple[list[str], float]] = (
+            collections.OrderedDict()
+        )
+        self._recall_hits = 0
+        self._recall_misses = 0
+        # 上下文组装缓存: key=hash(session+user+system+last_msg_id), value=(messages, expire_at)
+        self._context_cache: collections.OrderedDict[str, tuple[list, float]] = (
+            collections.OrderedDict()
+        )
+        self._context_hits = 0
+        self._context_misses = 0
 
     async def build_context(
         self,
@@ -99,19 +121,39 @@ class ContextManager:
             budget = int(self._llm.context_limit * 0.80)
             return self._truncate_to_budget(messages, budget, system_prompt)
 
-        # 1. 获取动态预算
+        # ---- 1. 先获取最近消息(用于缓存 key) ----
+        recent = await self._store.history(session_id, limit=self._recent_window)
+        last_msg_id = str(getattr(recent[-1], "id", 0)) if recent else "0"
+
+        # ---- 2. 查上下文缓存 ----
+        cache_key = hashlib.sha256(
+            f"{session_id}:{user_content}:{system_prompt}:{last_msg_id}".encode("utf-8")
+        ).hexdigest()
+        cached = self._context_cache.get(cache_key)
+        if cached is not None:
+            messages, expire_at = cached
+            if time.monotonic() <= expire_at:
+                self._context_cache.move_to_end(cache_key)
+                self._context_hits += 1
+                logger.debug(
+                    "context cache hit for session=%s (hits=%d, misses=%d)",
+                    session_id,
+                    self._context_hits,
+                    self._context_misses,
+                )
+                return list(messages)
+            del self._context_cache[cache_key]
+
+        # ---- 3. 获取动态预算 ----
         budget = self._budget.get_budget()
 
-        # 2. 获取最近消息
-        recent = await self._store.history(session_id, limit=self._recent_window)
-
-        # 3. 获取中期摘要(覆盖早期对话)
+        # ---- 4. 获取中期摘要 ----
         summary_text = await self._load_summaries(session_id)
 
-        # 4. 向量召回
+        # ---- 5. 向量召回 ----
         recalled = await self._recall_vectors(session_id, user_content)
 
-        # 5. 组装消息
+        # ---- 6. 组装消息 ----
         messages = self._assemble(
             system_prompt=system_prompt,
             summary_text=summary_text,
@@ -128,6 +170,12 @@ class ContextManager:
         # 8. 记录 token 使用(如果有上一次的 usage)
         if self._llm.last_usage:
             self._budget.record(self._llm.last_usage)
+
+        # 9. 写上下文缓存
+        if len(self._context_cache) >= self._CONTEXT_CACHE_MAX:
+            self._context_cache.popitem(last=False)
+        self._context_cache[cache_key] = (truncated, time.monotonic() + self._CONTEXT_CACHE_TTL)
+        self._context_misses += 1
 
         return truncated
 
@@ -163,10 +211,32 @@ class ContextManager:
         """向量召回相关历史。
 
         通过 prts-vector__search 工具查询与当前问题语义相近的历史记录。
+        结果缓存 5 分钟,避免同一 query 的重复 embed + 搜索。
         """
         if self._embedding is None or self._tools is None:
             return []
 
+        # ---- 1. 查缓存 ----
+        cache_key = hashlib.sha256(
+            f"{session_id}:{user_content}".encode("utf-8")
+        ).hexdigest()
+        cached = self._recall_cache.get(cache_key)
+        if cached is not None:
+            results, expire_at = cached
+            if time.monotonic() <= expire_at:
+                self._recall_cache.move_to_end(cache_key)
+                self._recall_hits += 1
+                logger.debug(
+                    "vector recall cache hit for session=%s (hits=%d, misses=%d)",
+                    session_id,
+                    self._recall_hits,
+                    self._recall_misses,
+                )
+                return list(results)
+            # TTL 过期:删除
+            del self._recall_cache[cache_key]
+
+        # ---- 2. 执行召回 ----
         try:
             vec = await self._embedding.embed(user_content)
             raw = await self._tools.invoke(
@@ -174,11 +244,11 @@ class ContextManager:
                 {"query_vector": vec, "top_k": self._vector_topk},
             )
 
+            texts: list[str] = []
             if isinstance(raw, str):
                 raw = json.loads(raw)
             if isinstance(raw, dict) and raw.get("ok"):
                 results = raw.get("results", [])
-                texts: list[str] = []
                 for r in results:
                     payload_str = r.get("payload")
                     if payload_str:
@@ -189,8 +259,21 @@ class ContextManager:
                             text = payload_str
                         if text:
                             texts.append(text)
-                logger.debug("vector recall: %d results for session=%s", len(texts), session_id)
-                return texts
+
+            # ---- 3. 写缓存 ----
+            if len(self._recall_cache) >= self._VECTOR_RECALL_MAX:
+                self._recall_cache.popitem(last=False)
+            self._recall_cache[cache_key] = (texts, time.monotonic() + self._VECTOR_RECALL_TTL)
+            self._recall_misses += 1
+
+            logger.debug(
+                "vector recall: %d results for session=%s (cached, hits=%d, misses=%d)",
+                len(texts),
+                session_id,
+                self._recall_hits,
+                self._recall_misses,
+            )
+            return texts
         except KeyError:
             # prts-vector__search 工具未注册(MCP server 未启用)
             logger.debug("prts-vector__search not available, skipping vector recall")

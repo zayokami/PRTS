@@ -6,6 +6,7 @@ P8: 根据历史 usage 模式和模型自报告,动态调整上下文窗口的 h
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import deque
 from typing import TYPE_CHECKING
@@ -22,15 +23,64 @@ _MAX_HISTORY = 10
 
 
 class DynamicBudget:
-    """根据最近 usage 动态建议 token 预算。"""
+    """根据最近 usage 动态建议 token 预算。
 
-    def __init__(self, llm: LlmClient) -> None:
+    P9: 支持将预算历史持久化到 SQLite,进程重启后可恢复长期模式。
+    """
+
+    def __init__(self, llm: LlmClient, store: Any = None) -> None:
         self._llm = llm
+        self._store = store
         self._history: deque[TokenUsage] = deque(maxlen=_MAX_HISTORY)
+        # P9: 启动时异步加载历史
+        if store is not None:
+            try:
+                import asyncio
+                asyncio.create_task(self._load_history())
+            except Exception:
+                logger.exception("failed to initiate budget history loading")
+
+    async def _load_history(self) -> None:
+        """从 SQLite 加载历史 usage。"""
+        try:
+            rows = await self._store.load_budget_history(self._llm.model_name, limit=_MAX_HISTORY)
+            from ..llm.base import TokenUsage
+            for prompt, completion, total in rows:
+                self._history.append(
+                    TokenUsage(
+                        prompt_tokens=prompt,
+                        completion_tokens=completion,
+                        total_tokens=total,
+                        model=self._llm.model_name,
+                    )
+                )
+            logger.info(
+                "loaded %d budget history records for %s",
+                len(rows),
+                self._llm.model_name,
+            )
+        except Exception:
+            logger.exception("failed to load budget history")
 
     def record(self, usage: TokenUsage) -> None:
-        """记录一轮对话的 usage。"""
+        """记录一轮对话的 usage。
+
+        P9: 同时异步持久化到 SQLite。
+        """
         self._history.append(usage)
+
+        if self._store is not None:
+            try:
+                asyncio.create_task(
+                    self._store.save_budget_usage(
+                        model=usage.model,
+                        prompt_tokens=usage.prompt_tokens,
+                        completion_tokens=usage.completion_tokens,
+                        total_tokens=usage.total_tokens,
+                    )
+                )
+            except Exception:
+                logger.exception("failed to persist budget usage")
 
     def get_budget(self) -> int:
         """返回建议的 prompt token 预算(不含 completion)。

@@ -72,6 +72,22 @@ CREATE TABLE IF NOT EXISTS summaries (
 );
 CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id, message_end);
 CREATE INDEX IF NOT EXISTS idx_summaries_importance ON summaries(session_id, importance DESC);
+-- P9: Token 校准缓存持久化
+CREATE TABLE IF NOT EXISTS token_calibration (
+    model           TEXT PRIMARY KEY,
+    history         TEXT NOT NULL,  -- JSON 数组: [{"heuristic": int, "actual": int}, ...]
+    updated_at      TEXT NOT NULL
+);
+-- P9: 预算历史持久化
+CREATE TABLE IF NOT EXISTS budget_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    model           TEXT NOT NULL,
+    prompt_tokens   INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    total_tokens    INTEGER NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_budget_model ON budget_history(model, created_at);
 """
 
 # 连接级 PRAGMA。WAL 让读写能并行,busy_timeout 让另一个进程在写锁时等而非
@@ -360,6 +376,134 @@ class SqliteStore:
                 placeholders = ",".join("?" * len(to_delete))
                 await conn.execute(
                     f"DELETE FROM summaries WHERE id IN ({placeholders})",
+                    to_delete,
+                )
+                await conn.commit()
+            return len(to_delete)
+
+    # ------------------------------------------------------------------
+    # P9: Token 校准缓存持久化
+    # ------------------------------------------------------------------
+
+    async def save_calibration(
+        self, model: str, history: list[tuple[int, int]]
+    ) -> None:
+        """保存某模型的校准历史到 SQLite。"""
+        data = [{"h": h, "a": a} for h, a in history]
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            await conn.execute(
+                """
+                INSERT INTO token_calibration (model, history, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(model) DO UPDATE SET
+                    history = excluded.history,
+                    updated_at = excluded.updated_at
+                """,
+                (model, json.dumps(data), _now()),
+            )
+            await conn.commit()
+
+    async def load_calibration(
+        self, model: str, max_entries: int = 20
+    ) -> list[tuple[int, int]]:
+        """从 SQLite 加载某模型的校准历史。"""
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            cursor = await conn.execute(
+                "SELECT history FROM token_calibration WHERE model = ?",
+                (model,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return []
+            data = json.loads(row[0])
+            # 只保留最近 max_entries 条
+            recent = data[-max_entries:] if len(data) > max_entries else data
+            return [(d["h"], d["a"]) for d in recent]
+
+    async def load_all_calibrations(
+        self, max_entries: int = 20
+    ) -> dict[str, list[tuple[int, int]]]:
+        """加载所有模型的校准历史。"""
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            cursor = await conn.execute(
+                "SELECT model, history FROM token_calibration"
+            )
+            rows = await cursor.fetchall()
+            result = {}
+            for model, history_json in rows:
+                data = json.loads(history_json)
+                recent = data[-max_entries:] if len(data) > max_entries else data
+                result[model] = [(d["h"], d["a"]) for d in recent]
+            return result
+
+    # ------------------------------------------------------------------
+    # P9: 预算历史持久化
+    # ------------------------------------------------------------------
+
+    async def save_budget_usage(
+        self,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+    ) -> None:
+        """记录一次 token usage 到预算历史。"""
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            await conn.execute(
+                """
+                INSERT INTO budget_history
+                    (model, prompt_tokens, completion_tokens, total_tokens, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (model, prompt_tokens, completion_tokens, total_tokens, _now()),
+            )
+            await conn.commit()
+
+    async def load_budget_history(
+        self, model: str, limit: int = 50
+    ) -> list[tuple[int, int, int]]:
+        """加载某模型的最近预算历史。
+
+        返回: [(prompt_tokens, completion_tokens, total_tokens), ...]
+        """
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            cursor = await conn.execute(
+                """
+                SELECT prompt_tokens, completion_tokens, total_tokens
+                FROM budget_history
+                WHERE model = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (model, limit),
+            )
+            rows = await cursor.fetchall()
+            # 按时间升序返回(和内存 deque 一致)
+            return list(reversed(rows))
+
+    async def delete_old_budget_history(self, model: str, keep: int = 100) -> int:
+        """清理旧预算历史,只保留最近 N 条。返回删除条数。"""
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            cursor = await conn.execute(
+                """
+                SELECT id FROM budget_history
+                WHERE model = ?
+                ORDER BY created_at DESC
+                LIMIT -1 OFFSET ?
+                """,
+                (model, keep),
+            )
+            to_delete = [r[0] for r in await cursor.fetchall()]
+            if to_delete:
+                placeholders = ",".join("?" * len(to_delete))
+                await conn.execute(
+                    f"DELETE FROM budget_history WHERE id IN ({placeholders})",
                     to_delete,
                 )
                 await conn.commit()

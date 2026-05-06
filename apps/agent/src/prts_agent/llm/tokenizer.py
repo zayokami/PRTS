@@ -337,6 +337,14 @@ _MAX_CALIBRATION_MODELS = 50
 _calibration_history: collections.OrderedDict[str, collections.deque[tuple[int, int]]] = (
     collections.OrderedDict()
 )
+# P9: 持久化存储引用(由外部在启动时注入)
+_calibration_store: Any = None
+
+
+def set_calibration_store(store: Any) -> None:
+    """注入 SQLite 存储实例,用于校准数据的持久化。"""
+    global _calibration_store
+    _calibration_store = store
 
 
 def record_usage_discrepancy(model: str, heuristic_tokens: int, actual_tokens: int) -> None:
@@ -344,6 +352,8 @@ def record_usage_discrepancy(model: str, heuristic_tokens: int, actual_tokens: i
 
     用于后续 ``estimate_prompt_tokens`` 的动态校准。只在实际 usage
     与 heuristic 差异显著(>5%)时记录,避免噪声。
+
+    P9: 同时异步持久化到 SQLite,进程重启后可恢复。
     """
     if heuristic_tokens <= 0 or actual_tokens <= 0:
         return
@@ -361,6 +371,17 @@ def record_usage_discrepancy(model: str, heuristic_tokens: int, actual_tokens: i
             _calibration_history.popitem(last=False)
         _calibration_history[model] = collections.deque(maxlen=_MAX_CALIBRATION_HISTORY)
     _calibration_history[model].append((heuristic_tokens, actual_tokens))
+
+    # P9: 异步持久化(不阻塞主流程)
+    if _calibration_store is not None:
+        try:
+            import asyncio
+            history = list(_calibration_history[model])
+            asyncio.create_task(
+                _calibration_store.save_calibration(model, history)
+            )
+        except Exception:
+            logger.exception("failed to persist calibration for %s", model)
 
 
 def get_calibration_ratio(model: str) -> float | None:
