@@ -13,6 +13,8 @@ from .hooks import (
 )
 from .permissions import ToolPermissionEngine, build_default_permission_engine
 from .registry import ToolDefinition, ToolRegistry, make_skill_invoker
+from .tool_result import ToolResult
+from .validator import ToolInputValidationError, validate_tool_input
 
 __all__ = [
     "HookStats",
@@ -23,10 +25,13 @@ __all__ = [
     "PreToolHook",
     "ToolDefinition",
     "ToolHooks",
+    "ToolInputValidationError",
     "ToolPermissionDenied",
     "ToolPermissionEngine",
     "ToolRegistry",
+    "ToolResult",
     "ToolTimeoutError",
     "build_default_permission_engine",
     "make_skill_invoker",
+    "validate_tool_input",
 ]

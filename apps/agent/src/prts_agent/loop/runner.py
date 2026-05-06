@@ -51,9 +51,8 @@ from ..runtime import bind_notify_queue, unbind_notify_queue
 from ..tools import (
     HookedToolRegistry,
     ToolHooks,
-    ToolPermissionDenied,
     ToolRegistry,
-    ToolTimeoutError,
+    ToolResult,
     build_default_permission_engine,
 )
 
@@ -112,11 +111,13 @@ def _stored_to_chat(messages: list) -> list[ChatMessage]:
 def _serialize_tool_result(result: Any) -> str:
     """工具结果统一转成字符串塞进 ``tool`` 消息的 content。
 
-    正常路径 invoker 已经把 MCP ``CallToolResult`` 拆开了,这里只剩 str / dict / list /
-    None 等普通值。但如果有人(单测、未来新接入的别的工具协议)直接把原始
-    ``CallToolResult`` 丢进来,``json.dumps`` 会忽略它的 ``content`` / ``structuredContent``
-    给一个空 ``{}``,LLM 就会拿到空字符串瞎猜。下面那段防御性分支兜底。
+    支持 ToolResult 和普通值。正常路径 invoker 已经把 MCP ``CallToolResult``
+    拆开了,这里只剩 str / dict / list / None 等普通值。
     """
+    # 新路径:ToolResult
+    if hasattr(result, "to_llm_text"):
+        return result.to_llm_text()
+
     if isinstance(result, str):
         return result
     if hasattr(result, "isError") and hasattr(result, "content"):
@@ -374,34 +375,19 @@ class AgentLoop:
                     max_concurrent=4,      # 最多同时执行 4 个工具
                 )
 
-                tool_outcomes: list[tuple[dict[str, Any], Any, bool]] = []
+                tool_outcomes: list[tuple[dict[str, Any], ToolResult]] = []
                 for call in pending_calls:
-                    is_error = False
-                    try:
-                        result = await hooked_tools.invoke(
-                            call["name"], call["arguments"]
-                        )
-                    except ToolPermissionDenied as exc:
-                        logger.warning("tool %s denied: %s", call["name"], exc)
-                        result = {"error": str(exc), "type": "ToolPermissionDenied"}
-                        is_error = True
-                    except ToolTimeoutError as exc:
-                        logger.error("tool %s timed out: %s", call["name"], exc)
-                        result = {"error": str(exc), "type": "ToolTimeoutError"}
-                        is_error = True
-                    except Exception as exc:  # noqa: BLE001
-                        logger.exception("tool %s failed", call["name"])
-                        result = {"error": str(exc), "type": type(exc).__name__}
-                        is_error = True
-
-                    tool_outcomes.append((call, result, is_error))
+                    result = await hooked_tools.invoke(
+                        call["name"], call["arguments"]
+                    )
+                    # result 一定是 ToolResult,不会抛异常
+                    tool_outcomes.append((call, result))
                     yield {
                         "event": "tool_result",
                         "data": {
                             "id": call["id"],
                             "name": call["name"],
-                            "result": result if not is_error else None,
-                            "error": result if is_error else None,
+                            **result.to_sse_dict(),
                         },
                     }
                     async for ne in self._drain_notify(notify_queue):
@@ -417,15 +403,16 @@ class AgentLoop:
                         meta={"tool_calls": pending_calls},
                     )
                 ]
-                for call, result, is_error in tool_outcomes:
+                for call, result in tool_outcomes:
                     batch.append(
                         PendingMessage(
                             role="tool",
-                            content=_truncate_for_llm(_serialize_tool_result(result)),
+                            content=_truncate_for_llm(result.to_llm_text()),
                             meta={
                                 "tool_call_id": call["id"],
                                 "tool_name": call["name"],
-                                "is_error": is_error,
+                                "is_error": result.is_error,
+                                "error_type": result.error_type,
                             },
                         )
                     )

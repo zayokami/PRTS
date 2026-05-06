@@ -1,16 +1,17 @@
-"""Smoke test for enhanced Tool Hooks + Permission Engine.
+"""Smoke test for enhanced Tool Hooks + Permission Engine + ToolResult.
 
 验证:
-1. Pre-hook 权限拒绝
+1. Pre-hook 权限拒绝 → ToolResult(is_error=True)
 2. Pre-hook 参数修改
 3. Post-hook 结果修改
 4. Post-hook 审计日志 + 统计
 5. Failure hook 降级处理
-6. 工具调用超时
+6. 工具调用超时 → ToolResult(is_error=True)
 7. 并发限制
 8. 配置文件加载
 9. 异常隔离 (单个 hook 失败不影响其他 hooks)
-10. ToolPermissionDenied / ToolTimeoutError
+10. ToolResult 结构化格式
+11. Schema 严格验证 (strict=True)
 """
 
 import asyncio
@@ -32,10 +33,12 @@ from prts_agent.tools.hooks import (
 )
 from prts_agent.tools.permissions import ToolPermissionEngine, build_default_permission_engine
 from prts_agent.tools.registry import ToolDefinition, ToolRegistry
+from prts_agent.tools.tool_result import ToolResult
+from prts_agent.tools.validator import ToolInputValidationError, validate_tool_input
 
 
 async def _echo(arguments):
-    await asyncio.sleep(0.001)  # 模拟微小延迟
+    await asyncio.sleep(0.001)
     return f"echo: {arguments.get('msg', '')}"
 
 
@@ -86,8 +89,7 @@ def make_registry():
         ToolDefinition(
             name="fail_me",
             description="fail",
-            input_schema={"type": "object", "properties": {}}
-,
+            input_schema={"type": "object", "properties": {}},
             invoker=_failing,
             source="builtin",
         )
@@ -96,7 +98,7 @@ def make_registry():
 
 
 async def test_permission_deny():
-    """1. 默认策略应拒绝 bash__exec。"""
+    """1. 默认策略应拒绝 bash__exec,返回 ToolResult(is_error=True)。"""
     reg = make_registry()
     hooks = ToolHooks()
     perm = build_default_permission_engine()
@@ -104,16 +106,16 @@ async def test_permission_deny():
 
     hooked = HookedToolRegistry(reg, hooks, session_id="s1", channel="test")
 
-    try:
-        await hooked.invoke("bash__exec", {"cmd": "rm -rf /"})
-        assert False, "should have raised ToolPermissionDenied"
-    except ToolPermissionDenied as exc:
-        assert "bash__exec" in str(exc)
-        print(f"  OK deny: {exc}")
+    result = await hooked.invoke("bash__exec", {"cmd": "rm -rf /"})
+    assert isinstance(result, ToolResult)
+    assert result.is_error is True
+    assert result.error_type == "ToolPermissionDenied"
+    assert "bash__exec" in result.error_message
+    print(f"  OK deny: {result.error_type} — {result.error_message}")
 
 
 async def test_permission_allow():
-    """2. 普通工具应允许通过。"""
+    """2. 普通工具应允许通过,返回 ToolResult(is_error=False)。"""
     reg = make_registry()
     hooks = ToolHooks()
     perm = build_default_permission_engine()
@@ -122,7 +124,9 @@ async def test_permission_allow():
     hooked = HookedToolRegistry(reg, hooks, session_id="s1", channel="test")
 
     result = await hooked.invoke("echo", {"msg": "hello"})
-    assert result == "echo: hello"
+    assert isinstance(result, ToolResult)
+    assert result.is_error is False
+    assert result.content == "echo: hello"
     print("  OK allow: echo passed")
 
 
@@ -142,7 +146,7 @@ async def test_pre_hook_modify():
     hooked = HookedToolRegistry(reg, hooks, session_id="s1", channel="test")
 
     result = await hooked.invoke("echo", {"msg": "original"})
-    assert result == "echo: modified", f"got: {result}"
+    assert result.content == "echo: modified", f"got: {result.content}"
     print("  OK modify: argument rewritten")
 
 
@@ -164,7 +168,7 @@ async def test_post_hook_modify_result():
     hooked = HookedToolRegistry(reg, hooks, session_id="s1", channel="test")
 
     result = await hooked.invoke("echo", {"msg": "test"})
-    assert result == "echo: test [processed]", f"got: {result}"
+    assert result.content == "echo: test [processed]", f"got: {result.content}"
     print("  OK post modify: result rewritten")
 
 
@@ -188,7 +192,8 @@ async def test_audit_and_stats():
 
     hooked = HookedToolRegistry(reg, hooks, session_id="s1", channel="test")
 
-    await hooked.invoke("echo", {"msg": "audit"})
+    result = await hooked.invoke("echo", {"msg": "audit"})
+    assert result.is_error is False
 
     stats = hooked.stats
     assert len(stats) >= 2  # pre + post
@@ -216,12 +221,13 @@ async def test_failure_hook_fallback():
     hooked = HookedToolRegistry(reg, hooks, session_id="s1", channel="test")
 
     result = await hooked.invoke("fail_me", {})
-    assert result == "fallback result", f"got: {result}"
+    assert result.is_error is False
+    assert result.content == "fallback result", f"got: {result.content}"
     print("  OK fallback: failure hook provided alternative result")
 
 
 async def test_timeout():
-    """7. 工具调用超时。"""
+    """7. 工具调用超时 → ToolResult(is_error=True)。"""
     reg = make_registry()
     hooks = ToolHooks()
 
@@ -229,12 +235,11 @@ async def test_timeout():
         reg, hooks, session_id="s1", channel="test", timeout_seconds=0.1
     )
 
-    try:
-        await hooked.invoke("slow", {"delay": 1.0})
-        assert False, "should have raised ToolTimeoutError"
-    except ToolTimeoutError as exc:
-        assert "timed out" in str(exc)
-        print(f"  OK timeout: {exc}")
+    result = await hooked.invoke("slow", {"delay": 1.0})
+    assert result.is_error is True
+    assert result.error_type == "ToolTimeoutError"
+    assert "timed out" in result.error_message
+    print(f"  OK timeout: {result.error_type}")
 
 
 async def test_concurrent_limit():
@@ -242,7 +247,6 @@ async def test_concurrent_limit():
     reg = make_registry()
     hooks = ToolHooks()
 
-    # 注册一个慢工具
     reg.register(
         ToolDefinition(
             name="concurrent_slow",
@@ -256,11 +260,10 @@ async def test_concurrent_limit():
     hooked = HookedToolRegistry(
         reg, hooks, session_id="s1", channel="test",
         timeout_seconds=5.0,
-        max_concurrent=2,  # 最多 2 个并发
+        max_concurrent=2,
     )
 
     start = asyncio.get_event_loop().time()
-    # 启动 4 个并发调用，每个 0.1s，限制为 2 个并发，总时间应约 0.2s
     tasks = [
         asyncio.create_task(hooked.invoke("concurrent_slow", {"delay": 0.1}))
         for _ in range(4)
@@ -268,7 +271,7 @@ async def test_concurrent_limit():
     results = await asyncio.gather(*tasks)
     elapsed = asyncio.get_event_loop().time() - start
 
-    assert all(r == "slept 0.1s" for r in results)
+    assert all(r.content == "slept 0.1s" for r in results)
     assert elapsed >= 0.18, f"concurrency not limited: {elapsed:.3f}s"
     print(f"  OK concurrent: 4 calls with max=2 took {elapsed:.3f}s")
 
@@ -298,7 +301,7 @@ async def test_exception_isolation():
     hooked = HookedToolRegistry(reg, hooks, session_id="s1", channel="test")
 
     result = await hooked.invoke("echo", {"msg": "isolation"})
-    assert result == "echo: isolation"
+    assert result.content == "echo: isolation"
 
     stats = hooked.stats
     assert len(stats) == 4
@@ -317,7 +320,6 @@ async def test_config_load_save():
 
         loaded = ToolPermissionEngine.load(path)
 
-        # 验证加载后的规则行为一致
         class FakeInv:
             name = "bash__exec"
             arguments = {}
@@ -330,31 +332,133 @@ async def test_config_load_save():
         print("  OK config: load/save roundtrip preserved rules")
 
 
+async def test_tool_result_format():
+    """11. ToolResult 结构化格式。"""
+    # 正常结果
+    r1 = ToolResult.success({"data": [1, 2, 3]})
+    assert r1.is_error is False
+    assert r1.to_llm_text() == '{"data": [1, 2, 3]}'
+    sse = r1.to_sse_dict()
+    assert sse["is_error"] is False
+    assert sse["content"] == {"data": [1, 2, 3]}
+
+    # 错误结果
+    r2 = ToolResult(
+        is_error=True,
+        error_type="ToolPermissionDenied",
+        error_message="denied",
+    )
+    assert r2.to_llm_text() == "[ERROR: ToolPermissionDenied]\ndenied"
+    sse2 = r2.to_sse_dict()
+    assert sse2["is_error"] is True
+    assert sse2["error_type"] == "ToolPermissionDenied"
+
+    # 从异常构造
+    r3 = ToolResult.from_exception(ValueError("bad arg"))
+    assert r3.is_error is True
+    assert r3.error_type == "ValueError"
+    assert r3.error_message == "bad arg"
+
+    print("  OK ToolResult: success, error, from_exception")
+
+
+async def test_schema_validation():
+    """12. JSON Schema 严格验证。"""
+    schema = {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+            "name": {"type": "string"},
+            "age": {"type": "integer"},
+        },
+    }
+
+    # 有效参数
+    validate_tool_input("test", schema, {"name": "Alice", "age": 30}, strict=True)
+
+    # 缺少 required
+    try:
+        validate_tool_input("test", schema, {"age": 30}, strict=True)
+        assert False, "should have raised"
+    except ToolInputValidationError as exc:
+        assert "name" in str(exc) and "required" in str(exc).lower()
+
+    # 类型错误
+    try:
+        validate_tool_input("test", schema, {"name": "Alice", "age": "thirty"}, strict=True)
+        assert False, "should have raised"
+    except ToolInputValidationError as exc:
+        assert "age" in str(exc) and "integer" in str(exc).lower()
+
+    # strict=False 时跳过
+    validate_tool_input("test", schema, {"bad": "data"}, strict=False)
+
+    print("  OK schema validation: required, type, strict toggle")
+
+
+async def _greet_async(arguments):
+    return f"Hello {arguments['name']}"
+
+
+async def test_strict_tool_invoke():
+    """13. strict=True 的工具在 invoke 时自动验证 schema。"""
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name="greet",
+            description="greet",
+            input_schema={
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string"}},
+            },
+            invoker=_greet_async,
+            source="builtin",
+            strict=True,  # 启用严格验证
+        )
+    )
+
+    hooks = ToolHooks()
+    hooked = HookedToolRegistry(reg, hooks)
+
+    # 有效调用
+    result = await hooked.invoke("greet", {"name": "World"})
+    print(f"DEBUG greet result: {result}")
+    assert result.is_error is False, f"expected success, got: {result}"
+    assert result.content == "Hello World"
+
+    # 无效调用:缺少 required
+    result = await hooked.invoke("greet", {})
+    assert result.is_error is True
+    assert result.error_type == "ToolInputValidationError"
+    assert "name" in result.error_message and "required" in result.error_message.lower()
+
+    # 无效调用:类型错误
+    result = await hooked.invoke("greet", {"name": 123})
+    assert result.is_error is True
+    assert result.error_type == "ToolInputValidationError"
+
+    print("  OK strict tool: auto-validation on invoke")
+
+
 async def main():
-    print("Enhanced Tool Hooks smoke test")
+    print("Enhanced Tool Hooks + ToolResult smoke test")
     print()
-    print("1. Permission deny")
     await test_permission_deny()
-    print("2. Permission allow")
     await test_permission_allow()
-    print("3. Pre-hook modify args")
     await test_pre_hook_modify()
-    print("4. Post-hook modify result")
     await test_post_hook_modify_result()
-    print("5. Audit + stats")
     await test_audit_and_stats()
-    print("6. Failure hook fallback")
     await test_failure_hook_fallback()
-    print("7. Timeout")
     await test_timeout()
-    print("8. Concurrent limit")
     await test_concurrent_limit()
-    print("9. Exception isolation")
     await test_exception_isolation()
-    print("10. Config load/save")
     await test_config_load_save()
+    await test_tool_result_format()
+    await test_schema_validation()
+    await test_strict_tool_invoke()
     print()
-    print("All enhanced hook tests passed!")
+    print("All tests passed!")
 
 
 if __name__ == "__main__":

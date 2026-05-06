@@ -24,7 +24,8 @@ class ToolDefinition:
     description: str | None
     input_schema: dict[str, Any]
     invoker: Callable[[dict[str, Any]], Awaitable[Any]]
-    source: str = "skill"  # P4 起会有 "mcp" / "builtin"
+    source: str = "skill"  # "mcp" / "builtin"
+    strict: bool = False  # 是否启用 JSON Schema 严格验证
     extra: dict[str, Any] = field(default_factory=dict)
 
 

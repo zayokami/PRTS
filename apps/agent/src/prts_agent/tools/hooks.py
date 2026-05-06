@@ -1,6 +1,7 @@
 """Tool Hooks —— 工具调用前后拦截与扩展。
 
-支持权限检查、审计日志、参数重写、结果后处理、失败恢复、超时控制、并发限制。
+支持权限检查、审计日志、参数重写、结果后处理、失败恢复、超时控制、并发限制、
+结构化错误标记、JSON Schema 严格验证。
 """
 
 from __future__ import annotations
@@ -12,11 +13,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from .tool_result import ToolResult
+
 logger = logging.getLogger(__name__)
 
 
 class ToolInvocation(Protocol):
-    """工具调用上下文，供 hook 读取和修改。"""
+    """工具调用上下文,供 hook 读取和修改。"""
 
     name: str
     arguments: dict[str, Any]
@@ -77,9 +80,11 @@ class HookStats:
 
 
 class HookedToolRegistry:
-    """包裹 ToolRegistry，在 invoke 前后执行 hooks。
+    """包裹 ToolRegistry,在 invoke 前后执行 hooks。
 
     增强特性:
+    - JSON Schema 严格验证 (strict=True 时自动检查参数)
+    - 结构化结果: 返回 ToolResult (含 is_error/error_type/error_message)
     - 超时控制 (timeout)
     - 并发限制 (semaphore)
     - pre hooks: 权限检查、参数修改
@@ -113,10 +118,19 @@ class HookedToolRegistry:
     def clear_stats(self) -> None:
         self._stats.clear()
 
-    async def invoke(self, name: str, arguments: dict[str, Any]) -> Any:
+    async def invoke(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        """执行工具调用,返回结构化的 ToolResult。
+
+        所有错误(权限拒绝、超时、异常)都被捕获并包装为 ToolResult(is_error=True),
+        不会向上抛出异常。调用方可以安全地读取 result.is_error 判断成功与否。
+        """
         tool = self._inner.get(name)
         if tool is None:
-            raise KeyError(f"unknown tool: {name}")
+            return ToolResult(
+                is_error=True,
+                error_type="ToolNotFound",
+                error_message=f"unknown tool: {name}",
+            )
 
         invocation = _SimpleInvocation(
             name=name,
@@ -128,7 +142,29 @@ class HookedToolRegistry:
 
         self._stats.clear()
 
-        # ---- Pre hooks ----
+        # ---- 0. JSON Schema 严格验证 (在 hooks 之前) ----
+        if getattr(tool, "strict", False):
+            try:
+                from .validator import ToolInputValidationError, validate_tool_input
+
+                validate_tool_input(
+                    tool_name=name,
+                    schema=tool.input_schema,
+                    arguments=arguments,
+                    strict=True,
+                )
+            except ToolInputValidationError as exc:
+                logger.warning("tool %s schema validation failed: %s", name, exc)
+                return ToolResult(
+                    is_error=True,
+                    error_type="ToolInputValidationError",
+                    error_message=str(exc),
+                )
+            except Exception:
+                logger.exception("schema validation error for %s", name)
+                # 验证器出 bug 时不应阻断调用,降级到允许
+
+        # ---- 1. Pre hooks ----
         for hook in self._hooks.pre:
             start = time.perf_counter()
             try:
@@ -153,7 +189,6 @@ class HookedToolRegistry:
                     )
                 )
                 logger.exception("pre-tool hook %s failed for %s", hook.__name__, name)
-                # 异常隔离：继续执行下一个 hook
                 continue
 
             if result.decision == "deny":
@@ -163,18 +198,20 @@ class HookedToolRegistry:
                     hook.__name__,
                     result.reason,
                 )
-                raise ToolPermissionDenied(
-                    f"tool {name} denied by {hook.__name__}: {result.reason}"
+                return ToolResult(
+                    is_error=True,
+                    error_type="ToolPermissionDenied",
+                    error_message=f"tool {name} denied by {hook.__name__}: {result.reason}",
                 )
             if result.decision == "modify" and result.modified_arguments:
                 invocation.arguments = result.modified_arguments
                 arguments = result.modified_arguments
 
-        # ---- 实际调用 (带并发限制 + 超时) ----
+        # ---- 2. 实际调用 (带并发限制 + 超时) ----
         start = time.perf_counter()
         async with self._semaphore:
             try:
-                result = await asyncio.wait_for(
+                raw_result = await asyncio.wait_for(
                     self._inner.invoke(name, arguments),
                     timeout=self._timeout,
                 )
@@ -182,9 +219,11 @@ class HookedToolRegistry:
             except asyncio.TimeoutError:
                 duration_ms = (time.perf_counter() - start) * 1000
                 logger.error("tool %s timed out after %.1fs", name, self._timeout)
-                raise ToolTimeoutError(
-                    f"tool {name} timed out after {self._timeout}s"
-                ) from None
+                return ToolResult(
+                    is_error=True,
+                    error_type="ToolTimeoutError",
+                    error_message=f"tool {name} timed out after {self._timeout}s",
+                )
             except Exception as exc:
                 duration_ms = (time.perf_counter() - start) * 1000
                 # ---- Failure hooks ----
@@ -202,13 +241,13 @@ class HookedToolRegistry:
                             )
                         )
                         if fh_result.decision == "modify" and fh_result.modified_result is not None:
-                            # failure hook 提供了降级结果
                             logger.info(
                                 "failure hook %s provided fallback for %s",
                                 hook.__name__,
                                 name,
                             )
-                            return fh_result.modified_result
+                            # failure hook 返回的降级结果视为成功
+                            return ToolResult.success(fh_result.modified_result)
                     except Exception as fh_exc:
                         fh_duration = (time.perf_counter() - hook_start) * 1000
                         self._stats.append(
@@ -222,13 +261,15 @@ class HookedToolRegistry:
                         logger.exception(
                             "failure hook %s failed for %s", hook.__name__, name
                         )
-                raise
+                # 无 failure hook 或都失败:包装为错误结果
+                return ToolResult.from_exception(exc)
 
-        # ---- Post hooks (成功时) ----
+        # ---- 3. Post hooks (成功时) ----
+        final_result = raw_result
         for hook in self._hooks.post:
             hook_start = time.perf_counter()
             try:
-                post_result = await hook(invocation, result, duration_ms)
+                post_result = await hook(invocation, raw_result, duration_ms)
                 hook_duration = (time.perf_counter() - hook_start) * 1000
                 self._stats.append(
                     HookStats(
@@ -239,7 +280,7 @@ class HookedToolRegistry:
                     )
                 )
                 if post_result.decision == "modify" and post_result.modified_result is not None:
-                    result = post_result.modified_result
+                    final_result = post_result.modified_result
                     logger.debug(
                         "post hook %s modified result for %s", hook.__name__, name
                     )
@@ -255,15 +296,15 @@ class HookedToolRegistry:
                 )
                 logger.exception("post-tool hook %s failed for %s", hook.__name__, name)
 
-        return result
+        return ToolResult.success(final_result)
 
 
 class ToolPermissionDenied(Exception):
-    """钩子拒绝工具调用时抛出。"""
+    """钩子拒绝工具调用时抛出。(向后兼容,新代码建议直接读取 ToolResult.is_error)"""
 
 
 class ToolTimeoutError(Exception):
-    """工具调用超时时抛出。"""
+    """工具调用超时时抛出。(向后兼容)"""
 
 
 @dataclass
