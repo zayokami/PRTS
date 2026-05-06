@@ -58,6 +58,7 @@ from ..tools import (
 
 from .budget import DynamicBudget
 from .context_manager import ContextManager
+from .state_machine import AgentState, AgentStateMachine
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +237,21 @@ class AgentLoop:
             tools=tools,
         )
 
+        # Agent state machine for explicit state tracking
+        self._state_machine = AgentStateMachine()
+
+        # Prompt injection guard
+        try:
+            from ..tools.prompt_injection import (
+                PromptInjectionClassifier,
+                build_injection_guard,
+            )
+
+            injection_classifier = PromptInjectionClassifier(sensitivity="medium")
+            self._hooks.register_pre(build_injection_guard(injection_classifier))
+        except Exception:
+            logger.exception("failed to initialize prompt injection guard")
+
     async def converse(
         self,
         session_id: str,
@@ -267,7 +283,11 @@ class AgentLoop:
         )
 
         try:
+            self._state_machine.start()
             for iteration in range(MAX_ITERATIONS):
+                self._state_machine.transition_to(
+                    AgentState.RUNNING, f"iteration {iteration}"
+                )
                 # Build context with three-tier memory assembly (short/mid/long-term)
                 messages = await self._context_manager.build_context(
                     session_id, user_content, system_prompt
@@ -346,13 +366,22 @@ class AgentLoop:
                         await self._auto_remember(
                             session_id, user_content, assistant_text, channel
                         )
+                    self._state_machine.complete("done")
                     yield {
                         "event": "done",
-                        "data": {"session_id": session_id, "stop_reason": stop_reason},
+                        "data": {
+                            "session_id": session_id,
+                            "stop_reason": stop_reason,
+                            "state": self._state_machine.to_dict(),
+                        },
                     }
                     return
 
                 # ---- 有工具调用:发事件 → invoke → 收结果 ----
+                self._state_machine.transition_to(
+                    AgentState.AWAITING_TOOL,
+                    f"{len(pending_calls)} tool_calls pending",
+                )
                 # 先 yield 所有 tool_call 事件让 UI 立刻看到;之后顺序执行,
                 # 每个 tool_result 事件都立刻 yield 出去,保留交互实时性。
                 for call in pending_calls:
@@ -432,6 +461,7 @@ class AgentLoop:
                     logger.warning("LLM stream ended without EndEvent")
 
             # 触底:工具循环过深。补一行 assistant 收尾,避免悬挂 tool_calls。
+            self._state_machine.fail(f"exceeded {MAX_ITERATIONS} iterations")
             await self._store.append_message(
                 session_id,
                 "assistant",
@@ -439,9 +469,21 @@ class AgentLoop:
             )
             yield {
                 "event": "error",
-                "data": {"message": f"agent loop exceeded {MAX_ITERATIONS} iterations"},
+                "data": {
+                    "message": f"agent loop exceeded {MAX_ITERATIONS} iterations",
+                    "state": self._state_machine.to_dict(),
+                },
             }
+        except Exception:
+            self._state_machine.fail("unexpected exception")
+            raise
         finally:
+            if self._state_machine.state not in (
+                AgentState.COMPLETED,
+                AgentState.ERROR,
+                AgentState.CANCELLED,
+            ):
+                self._state_machine.complete("converse ended")
             unbind_notify_queue(nq_token)
             prts_reset(ctx_token)
 
