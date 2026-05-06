@@ -24,6 +24,7 @@ const SESSION_KEY = "prts.session_id";
 const PING_INTERVAL_MS = 30000;
 const INITIAL_RETRY_MS = 1000;
 const MAX_RETRY_MS = 30000;
+const MAX_MESSAGES = 500; // 消息上限,防止长对话内存爆炸
 
 function summarize(value: unknown, max = 240): string {
   if (value === undefined || value === null) return "";
@@ -49,6 +50,18 @@ export default function App() {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryCountRef = useRef(0);
   const shouldReconnectRef = useRef(true);
+
+  /** 添加消息并截断到 MAX_MESSAGES,防止长对话内存泄漏。 */
+  const pushMessage = (msg: Msg) => {
+    setMessages((prev) => {
+      const next = [...prev, msg];
+      if (next.length > MAX_MESSAGES) {
+        // 保留最近 MAX_MESSAGES 条,丢弃最旧的
+        return next.slice(next.length - MAX_MESSAGES);
+      }
+      return next;
+    });
+  };
 
   const connect = () => {
     if (!shouldReconnectRef.current) return;
@@ -106,34 +119,22 @@ export default function App() {
           return next;
         });
       } else if (frame.type === "tool_call") {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "system",
-            kind: "tool",
-            content: `→ 调用 ${frame.name}(${summarize(frame.arguments, 160)})`,
-          },
-        ]);
+        pushMessage({
+          role: "system",
+          kind: "tool",
+          content: `→ 调用 ${frame.name}(${summarize(frame.arguments, 160)})`,
+        });
       } else if (frame.type === "tool_result") {
         const isErr = frame.error !== undefined && frame.error !== null;
         const label = isErr ? `✗ ${frame.name} 失败` : `← ${frame.name} 返回`;
         const body = summarize(isErr ? frame.error : frame.result, 320);
-        setMessages((prev) => [
-          ...prev,
-          { role: "system", kind: "tool", content: `${label}: ${body}` },
-        ]);
+        pushMessage({ role: "system", kind: "tool", content: `${label}: ${body}` });
       } else if (frame.type === "notify") {
-        setMessages((prev) => [
-          ...prev,
-          { role: "system", kind: "notify", content: `🔔 ${frame.message}` },
-        ]);
+        pushMessage({ role: "system", kind: "notify", content: `🔔 ${frame.message}` });
       } else if (frame.type === "done") {
         setStatus("ready");
       } else if (frame.type === "error") {
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: `[error] ${frame.message}`, kind: "text" },
-        ]);
+        pushMessage({ role: "assistant", content: `[error] ${frame.message}`, kind: "text" });
         setStatus("ready");
       }
     };
@@ -196,7 +197,7 @@ export default function App() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
     ws.send(JSON.stringify({ type: "user", content: text }));
-    setMessages((prev) => [...prev, { role: "user", content: text, kind: "text" }]);
+    pushMessage({ role: "user", content: text, kind: "text" });
     setInput("");
     setStatus("streaming");
   };

@@ -143,6 +143,10 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
                 logger.exception("embedding_client close failed")
 
 
+app = FastAPI(title="PRTS Agent", version="0.1.0", lifespan=lifespan)
+app.include_router(agent_router)
+
+
 # ---------------------------------------------------------------------------
 # 简单内存限流器:基于客户端 IP 的滑动窗口
 # ---------------------------------------------------------------------------
@@ -179,10 +183,6 @@ async def rate_limit_middleware(request, call_next):
 
     bucket.append(now)
     return await call_next(request)
-
-
-app = FastAPI(title="PRTS Agent", version="0.1.0", lifespan=lifespan)
-app.include_router(agent_router)
 
 
 @app.get("/health")

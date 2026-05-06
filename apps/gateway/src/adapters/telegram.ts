@@ -72,6 +72,17 @@ function isTextFile(filename: string): boolean {
   return TEXT_EXTENSIONS.has(ext);
 }
 
+/** Telegram 多媒体消息的公共字段(grammy 风格的子集)。 */
+interface TelegramMediaMessage {
+  caption?: string;
+  photo?: Array<{ file_id: string; width: number; height: number }>;
+  voice?: { file_id: string; mime_type?: string };
+  audio?: { file_id: string; mime_type?: string; file_name?: string; title?: string; performer?: string };
+  document?: { file_id: string; file_name?: string };
+  video?: { file_id: string; file_name?: string; mime_type?: string };
+  video_note?: { file_id: string };
+}
+
 /** 读取文本文件前 maxBytes 字节,返回 UTF-8 字符串(超长截断)。 */
 async function readTextPreview(filePath: string, maxBytes = 50_000): Promise<string | null> {
   try {
@@ -106,7 +117,7 @@ async function downloadTelegramFile(
     await fs.mkdir(path.dirname(destPath), { recursive: true });
     const body = resp.body;
     if (!body) return null;
-    await pipeline(Readable.fromWeb(body as any), createWriteStream(destPath));
+    await pipeline(Readable.fromWeb(body as ReadableStream<Uint8Array>), createWriteStream(destPath));
     return destPath;
   } catch (err) {
     console.error("[telegram] download failed:", err);
@@ -181,7 +192,7 @@ async function buildMediaContent(
   token: string,
   workspaceDir: string,
   chatId: number,
-  message: any,
+  message: TelegramMediaMessage,
 ): Promise<string> {
   const ts = Date.now();
   const baseDir = path.join(workspaceDir, "telegram", "media", String(chatId));
@@ -249,6 +260,7 @@ async function buildMediaContent(
   // Video / VideoNote
   if (message.video || message.video_note) {
     const vid = message.video || message.video_note;
+    if (!vid) return "[未知视频类型]";
     const fileName = message.video?.file_name || `${ts}_video.mp4`;
     const dest = path.join(baseDir, fileName);
     const saved = await downloadTelegramFile(bot, token, vid.file_id, dest);

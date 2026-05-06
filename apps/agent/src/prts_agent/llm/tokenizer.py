@@ -331,8 +331,12 @@ def count_messages_tokens(messages: list[dict]) -> int:
 
 # 记录最近 N 次 heuristic vs actual 的误差比例,用于渐进校准。
 # key: model_name, value: deque of (heuristic, actual) 比例
-_calibration_history: dict[str, collections.deque[tuple[int, int]]] = {}
+# 用 OrderedDict 做 LRU:当模型种类过多时自动淘汰最久未用的,防止内存泄漏。
 _MAX_CALIBRATION_HISTORY = 20
+_MAX_CALIBRATION_MODELS = 50
+_calibration_history: collections.OrderedDict[str, collections.deque[tuple[int, int]]] = (
+    collections.OrderedDict()
+)
 
 
 def record_usage_discrepancy(model: str, heuristic_tokens: int, actual_tokens: int) -> None:
@@ -348,9 +352,13 @@ def record_usage_discrepancy(model: str, heuristic_tokens: int, actual_tokens: i
     if not (0.3 <= ratio <= 3.0):
         return
 
-    import collections
-
-    if model not in _calibration_history:
+    # 移到末尾表示"最近使用"
+    if model in _calibration_history:
+        _calibration_history.move_to_end(model)
+    else:
+        # 超限淘汰最久未用的 model
+        if len(_calibration_history) >= _MAX_CALIBRATION_MODELS:
+            _calibration_history.popitem(last=False)
         _calibration_history[model] = collections.deque(maxlen=_MAX_CALIBRATION_HISTORY)
     _calibration_history[model].append((heuristic_tokens, actual_tokens))
 
