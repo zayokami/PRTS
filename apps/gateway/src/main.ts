@@ -1,13 +1,18 @@
 import Fastify from "fastify";
 import websocket from "@fastify/websocket";
+import fastifyStatic from "@fastify/static";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { createTelegramBot, createWebhookHandler, startTelegramBot } from "./adapters/telegram.js";
 import { generateWebSessionId, isValidSessionId } from "./session/id.js";
 
 const PORT = Number(process.env.GATEWAY_PORT ?? 4787);
 const AGENT_URL = process.env.AGENT_URL ?? `http://127.0.0.1:${process.env.AGENT_PORT ?? 4788}`;
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DASHBOARD_DIST = path.join(__dirname, "..", "..", "dashboard", "dist");
 
 const app = Fastify({ logger: true });
 
@@ -268,6 +273,28 @@ if (botToken) {
     });
   }
 }
+
+// Serve dashboard static files (production build from apps/dashboard/dist)
+await app.register(fastifyStatic, {
+  root: DASHBOARD_DIST,
+  prefix: "/",
+});
+
+// SPA fallback: serve index.html for non-API routes (client-side routing)
+app.setNotFoundHandler(async (req, reply) => {
+  const url = req.url;
+  // Don't interfere with API/WebSocket/Telegram routes
+  if (
+    url.startsWith("/api/") ||
+    url.startsWith("/ws/") ||
+    url.startsWith("/telegram/") ||
+    url === "/health"
+  ) {
+    reply.code(404).send({ error: "Not Found" });
+    return;
+  }
+  return reply.sendFile("index.html", DASHBOARD_DIST);
+});
 
 try {
   await app.listen({ port: PORT, host: "127.0.0.1" });
