@@ -239,6 +239,9 @@ class ContextManager:
         # ---- 2. 执行召回 ----
         try:
             vec = await self._embedding.embed(user_content)
+            if not vec:
+                # Embedding API 不可用(如 DeepSeek 返回 404),跳过向量召回
+                return []
             raw = await self._tools.invoke(
                 "prts-vector__search",
                 {"query_vector": vec, "top_k": self._vector_topk},
@@ -307,10 +310,26 @@ class ContextManager:
 
         # 最近消息
         for m in recent:
-            msg: ChatMessage = {"role": m.role, "content": m.content}
+            # DeepSeek 要求 assistant 消息有非空 content
+            content = m.content if m.content and m.content.strip() else "(调用工具中...)"
+            msg: ChatMessage = {"role": m.role, "content": content}
             if m.meta:
                 if m.meta.get("tool_calls"):
-                    msg["tool_calls"] = m.meta["tool_calls"]
+                    # OpenAI 格式要求每个 tool_call 必须有 type="function"
+                    msg["tool_calls"] = [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False),
+                            },
+                        }
+                        for tc in m.meta["tool_calls"]
+                    ]
+                # DeepSeek V4: 传递 reasoning_content 用于多轮对话
+                if m.meta.get("reasoning_content"):
+                    msg["reasoning_content"] = m.meta["reasoning_content"]
                 if m.meta.get("tool_call_id"):
                     msg["tool_call_id"] = m.meta["tool_call_id"]
                 if m.meta.get("tool_name"):

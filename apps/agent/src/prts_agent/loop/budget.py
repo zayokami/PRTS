@@ -58,7 +58,7 @@ class DynamicBudget:
             logger.info(
                 "loaded %d budget history records for %s",
                 len(rows),
-                self._llm.model_name,
+                model_name,
             )
         except Exception:
             logger.exception("failed to load budget history")

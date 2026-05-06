@@ -25,6 +25,7 @@ class ChatMessage(TypedDict, total=False):
     tool_calls: list[dict[str, Any]]  # OpenAI 风格,assistant 携带的工具调用
     tool_call_id: str  # OpenAI 风格,tool 消息回填
     name: str  # OpenAI 风格,tool 消息工具名
+    reasoning_content: str  # DeepSeek V4 推理内容,多轮对话必须传回
 
 
 @dataclass
@@ -86,6 +87,7 @@ class LlmClient(ABC):
 
     def __init__(self) -> None:
         self._last_usage: TokenUsage | None = None
+        self._last_reasoning_content: str = ""
 
     @property
     @abstractmethod
@@ -107,6 +109,14 @@ class LlmClient(ABC):
         仅在流正常结束后有效;如果流中途取消或未发 UsageEvent,可能为 None。
         """
         return self._last_usage
+
+    @property
+    def last_reasoning_content(self) -> str:
+        """上一次 ``stream_chat`` 的 reasoning_content (DeepSeek V4 等推理模型)。
+
+        多轮对话中必须传回给 API,否则会得到 400 错误。
+        """
+        return self._last_reasoning_content
 
     @abstractmethod
     def stream_chat(

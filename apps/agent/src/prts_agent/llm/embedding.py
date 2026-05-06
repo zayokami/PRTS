@@ -70,12 +70,23 @@ class EmbeddingClient:
         if self._api_key:
             headers["authorization"] = f"Bearer {self._api_key}"
 
-        resp = await self._client.post(
-            url,
-            headers=headers,
-            json={"input": text, "model": self._model},
-        )
-        resp.raise_for_status()
+        try:
+            resp = await self._client.post(
+                url,
+                headers=headers,
+                json={"input": text, "model": self._model},
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                # Provider 不支持 embedding API (如 DeepSeek),静默跳过
+                logger.warning(
+                    "embedding API not available at %s (404). "
+                    "Vector memory will be disabled.",
+                    url,
+                )
+                return []
+            raise
         data: dict[str, Any] = resp.json()
         embedding = data["data"][0]["embedding"]
         assert isinstance(embedding, list)

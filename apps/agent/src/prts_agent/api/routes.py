@@ -356,6 +356,100 @@ async def handle_cron_event(req: CronEventRequest, request: Request) -> CronEven
 
 
 # ---------------------------------------------------------------------------
+# Core chat routes (restored from commit 6083fac)
+# ---------------------------------------------------------------------------
+
+def _sse_safe_dumps(data: Any) -> str:
+    """SSE data 的安全序列化。
+
+    - ``ensure_ascii=False``:中文按字面输出,不让 \\uXXXX 占满帧
+    - ``default=str``:工具结果可能包含 datetime 等非 JSON 原生类型,先兜底转字符串
+    - U+2028 / U+2029:在 ECMA-404 中当作合法 JSON 字符,但 ECMA-262 之前把它们当作
+      行终止符,某些老旧 SSE 中间件 / 浏览器会把帧从中切断 —— 显式转义
+    """
+    text = json.dumps(data, ensure_ascii=False, default=str)
+    return text.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+
+
+@router.post("/converse")
+async def converse(req: ConverseRequest, request: Request) -> EventSourceResponse:
+    """核心对话接口:接收用户消息,通过 AgentLoop 流式返回 SSE 事件。"""
+    workspace_dir = request.app.state.workspace_dir
+    system_prompt = load_system_prompt(workspace_dir)
+    loop = _loop(request)
+
+    async def event_stream() -> AsyncIterator[dict[str, str]]:
+        try:
+            async for evt in loop.converse(
+                session_id=req.session_id,
+                user_content=req.content,
+                system_prompt=system_prompt,
+                channel=req.channel,
+                user_ref=req.user_ref,
+            ):
+                # 客户端断开时停止生成,避免 LLM 浪费 + DB 写盘成本
+                if await request.is_disconnected():
+                    logger.info(
+                        "client disconnected, aborting converse for session=%s",
+                        req.session_id,
+                    )
+                    break
+                yield {"event": evt["event"], "data": _sse_safe_dumps(evt["data"])}
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("converse loop failed")
+            yield {
+                "event": "error",
+                "data": _sse_safe_dumps(
+                    {"message": str(exc), "type": type(exc).__name__}
+                ),
+            }
+
+    return EventSourceResponse(event_stream())
+
+
+@router.get("/sessions/{session_id}/history", response_model=HistoryResponse)
+async def get_history(
+    session_id: str, request: Request, limit: int = 500
+) -> HistoryResponse:
+    """返回会话历史 ``limit`` 条 user/assistant 消息(不含系统消息)。
+
+    默认 500 是给 Dashboard 前端渲染用的"足够大"值;历史会话很长时,旧消息
+    由 P7 摘要缩略。``limit`` 范围 [1, 5000],超界会被钳制,避免单请求导致
+    巨量 JSON dump 到客户端。
+    """
+    # FastAPI 会校验 int 类型,但范围校验需要自己做(比如传 limit=-1
+    # 会被 SQLite 报错,把会话历史搞崩 P0 状态)。
+    limit = max(1, min(limit, 5000))
+    store = _store(request)
+    rows = await store.history(session_id, limit=limit)
+    return HistoryResponse(
+        session_id=session_id,
+        messages=[
+            HistoryMessage(role=m.role, content=m.content, created_at=m.created_at)
+            for m in rows
+            if m.role in ("user", "assistant")
+        ],
+    )
+
+
+@router.get("/skills", response_model=SkillsResponse)
+async def list_skills(request: Request) -> SkillsResponse:
+    """返回已注册的 skill 列表(LLM 看到的工具面)。"""
+    tools = _tools(request)
+    return SkillsResponse(
+        skills=[
+            SkillInfo(
+                name=t.name,
+                description=t.description,
+                input_schema=t.input_schema,
+                source=t.source,
+            )
+            for t in tools.all()
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
 # Request helpers
 # ---------------------------------------------------------------------------
 
@@ -381,6 +475,14 @@ def _tools(request: Request) -> ToolRegistry:
     if tools is None:
         raise RuntimeError("tools not initialized")
     return tools
+
+
+def _loop(request: Request) -> AgentLoop:
+    """从 app.state 提取 AgentLoop。"""
+    loop = getattr(request.app.state, "agent_loop", None)
+    if loop is None:
+        raise RuntimeError("agent_loop not initialized")
+    return loop  # type: ignore[no-any-return]
 
 
 # ---------------------------------------------------------------------------

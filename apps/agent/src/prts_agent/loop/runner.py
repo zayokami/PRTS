@@ -65,13 +65,9 @@ logger = logging.getLogger(__name__)
 MAX_ITERATIONS = 8
 MAX_TOOL_RESULT_CHARS = 16000
 
-# --- P8 DEPRECATED: 以下常量已被 ContextManager 接管,保留仅向后兼容 ---
-# RECENT_WINDOW, VECTOR_TOPK, TOKEN_HEADROOM, MIN_RECENT_PAIRS
-# 现在通过 PRTS_CONTEXT_MODE / ContextManager 参数控制。
-# RECENT_WINDOW = 20  # 见 context_manager.DEFAULT_RECENT_WINDOW
-# VECTOR_TOPK = 5     # 见 context_manager.DEFAULT_VECTOR_TOPK
-# TOKEN_HEADROOM = 0.80  # 见 budget.DynamicBudget
-# MIN_RECENT_PAIRS = 4   # 见 context_manager.MIN_RECENT_PAIRS
+# Context assembly constants — 被 runner 直接引用
+RECENT_WINDOW = 20  # 见 context_manager.DEFAULT_RECENT_WINDOW
+VECTOR_TOPK = 5     # 见 context_manager.DEFAULT_VECTOR_TOPK
 
 
 def _stored_to_chat(messages: list) -> list[ChatMessage]:
@@ -79,19 +75,26 @@ def _stored_to_chat(messages: list) -> list[ChatMessage]:
     out: list[ChatMessage] = []
     for m in messages:
         if m.role == "assistant":
-            msg: ChatMessage = {"role": "assistant", "content": m.content}
-            if m.meta and m.meta.get("tool_calls"):
-                msg["tool_calls"] = [
-                    {
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": json.dumps(tc["arguments"], ensure_ascii=False),
-                        },
-                    }
-                    for tc in m.meta["tool_calls"]
-                ]
+            # DeepSeek 要求 assistant 消息有非空 content
+            content = m.content if m.content and m.content.strip() else "(调用工具中...)"
+            msg: ChatMessage = {"role": "assistant", "content": content}
+            if m.meta:
+                if m.meta.get("tool_calls"):
+                    # OpenAI 格式要求每个 tool_call 必须有 type="function"
+                    msg["tool_calls"] = [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False),
+                            },
+                        }
+                        for tc in m.meta["tool_calls"]
+                    ]
+                # DeepSeek V4: 传递 reasoning_content
+                if m.meta.get("reasoning_content"):
+                    msg["reasoning_content"] = m.meta["reasoning_content"]
             out.append(msg)
         elif m.role == "tool":
             tool_call_id = (m.meta or {}).get("tool_call_id", "")
@@ -425,11 +428,18 @@ class AgentLoop:
                 # ---- 一次事务把 assistant + 所有 tool 行写下去 ----
                 # 这样要么本轮的 (assistant + 全部 tool_results) 整体在 history 里,
                 # 要么完全不在,绝不会出现 assistant 有 tool_calls 而 tool_result 缺失。
+                # DeepSeek 要求 assistant 消息有非空 content，即使只有 tool_calls
+                safe_content = assistant_text if assistant_text.strip() else "(调用工具中...)"
+                assistant_meta: dict[str, Any] = {"tool_calls": pending_calls}
+                # DeepSeek V4: 保存 reasoning_content 用于多轮对话传回
+                reasoning = getattr(self._llm, "last_reasoning_content", "")
+                if reasoning:
+                    assistant_meta["reasoning_content"] = reasoning
                 batch: list[PendingMessage] = [
                     PendingMessage(
                         role="assistant",
-                        content=assistant_text,
-                        meta={"tool_calls": pending_calls},
+                        content=safe_content,
+                        meta=assistant_meta,
                     )
                 ]
                 for call, result in tool_outcomes:
@@ -500,6 +510,9 @@ class AgentLoop:
         try:
             text = f"[{channel}] User: {user_content}\nAssistant: {assistant_text}"
             vec = await self._embedding.embed(text)
+            if not vec:
+                # Embedding API 不可用,跳过
+                return
             mem_id = f"{session_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
             await self._tools.invoke(
                 "prts-vector__upsert",

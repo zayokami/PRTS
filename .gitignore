@@ -30,6 +30,7 @@ db/*.db
 db/*.db-journal
 db/*.db-wal
 db/*.db-shm
+apps/agent/db/
 logs/
 *.log
 

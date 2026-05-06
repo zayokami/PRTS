@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 class OpenAILlmClient(LlmClient):
     def __init__(self, base_url: str, api_key: str, model: str) -> None:
+        super().__init__()
         self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self._model = model
 
@@ -61,6 +62,7 @@ class OpenAILlmClient(LlmClient):
         #   delta.tool_calls = [{"index": 0, "id": "call_x", "function": {"name": "...", "arguments": "..."}}]
         tool_buf: dict[int, dict[str, Any]] = {}
         text_acc: list[str] = []
+        reasoning_acc: list[str] = []
         finish_reason: str | None = None
 
         async for chunk in stream:
@@ -93,6 +95,11 @@ class OpenAILlmClient(LlmClient):
             if delta is None:
                 pass
             else:
+                # DeepSeek V4: 捕获 reasoning_content (多轮对话必须传回)
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    reasoning_acc.append(rc)
+
                 if delta.content:
                     text_acc.append(delta.content)
                     yield TextEvent(type="text", delta=delta.content)
@@ -133,6 +140,12 @@ class OpenAILlmClient(LlmClient):
 
         # 把"原样的 assistant 消息"打包给上层,方便回填给下一轮 LLM
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_text}
+        if reasoning_acc:
+            reasoning_text = "".join(reasoning_acc)
+            assistant_msg["reasoning_content"] = reasoning_text
+            self._last_reasoning_content = reasoning_text
+        else:
+            self._last_reasoning_content = ""
         if tool_calls_out:
             assistant_msg["tool_calls"] = [
                 {

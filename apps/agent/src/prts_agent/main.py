@@ -148,6 +148,25 @@ app.include_router(agent_router)
 
 
 # ---------------------------------------------------------------------------
+# 根路径:简易聊天界面
+# ---------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    """返回简易 HTML 聊天界面。"""
+    return {
+        "service": "prts-agent",
+        "version": "0.1.0",
+        "endpoints": {
+            "health": "/health",
+            "chat": "POST /agent/v1/converse",
+            "history": "GET /agent/v1/sessions/{id}/history",
+            "skills": "GET /agent/v1/skills",
+        },
+        "message": "Use POST /agent/v1/converse with JSON body: {\"session_id\": \"test\", \"content\": \"hello\", \"channel\": \"web\"}",
+    }
+
+
+# ---------------------------------------------------------------------------
 # 简单内存限流器:基于客户端 IP 的滑动窗口
 # ---------------------------------------------------------------------------
 from collections import defaultdict
