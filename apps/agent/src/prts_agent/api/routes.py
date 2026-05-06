@@ -246,6 +246,10 @@ async def handle_fs_event(req: FsEventRequest, request: Request) -> FsEventRespo
 @router.get("/sessions/{session_id}/summaries", response_model=SummariesResponse)
 async def get_summaries(session_id: str, request: Request) -> SummariesResponse:
     """返回会话已生成的对话摘要列表(中期记忆)。"""
+    try:
+        _validate_session_id(session_id)
+    except ValueError as exc:
+        return SummariesResponse(session_id=session_id, summaries=[])
     store = _store(request)
     rows = await store.get_summaries(session_id, limit=10)
     return SummariesResponse(
@@ -265,6 +269,10 @@ async def get_summaries(session_id: str, request: Request) -> SummariesResponse:
             for r in rows
         ],
     )
+
+
+# task_name -> asyncio.Lock:防止同一个 task 被并发调度多次
+_task_execution_locks: dict[str, asyncio.Lock] = {}
 
 
 @router.post("/events/cron", response_model=CronEventResponse)
@@ -289,17 +297,83 @@ async def handle_cron_event(req: CronEventRequest, request: Request) -> CronEven
     import asyncio
     import inspect
 
-    try:
-        func = target.func
-        if inspect.iscoroutinefunction(func):
-            result = await func()
-        else:
-            result = func()
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("task %s execution failed", req.task_name)
+    # 并发控制:同一 task 同时只能跑一个实例
+    lock = _task_execution_locks.setdefault(req.task_name, asyncio.Lock())
+    if lock.locked():
+        logger.warning("task %s skipped: already running", req.task_name)
         return CronEventResponse(
-            ok=False, error=f"{type(exc).__name__}: {exc}"
+            ok=False, error=f"task {req.task_name!r} is already running"
         )
+
+    async with lock:
+        try:
+            func = target.func
+            # 30 秒超时:task 应该是轻量后台作业,不应该跑太久
+            TASK_TIMEOUT = 30.0
+            if inspect.iscoroutinefunction(func):
+                result = await asyncio.wait_for(func(), timeout=TASK_TIMEOUT)
+            else:
+                # 同步函数在线程池中跑,避免阻塞事件循环
+                loop = asyncio.get_running_loop()
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(None, func), timeout=TASK_TIMEOUT
+                )
+        except asyncio.TimeoutError:
+            logger.error("task %s timed out after %.1fs", req.task_name, TASK_TIMEOUT)
+            return CronEventResponse(
+                ok=False, error=f"task {req.task_name!r} timed out after {TASK_TIMEOUT}s"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("task %s execution failed", req.task_name)
+            return CronEventResponse(
+                ok=False, error=f"{type(exc).__name__}: {exc}"
+            )
 
     logger.info("task %s finished with result=%r", req.task_name, result)
     return CronEventResponse(ok=True, result=result)
+
+
+# ---------------------------------------------------------------------------
+# Request helpers
+# ---------------------------------------------------------------------------
+
+def _workspace_dir(request: Request) -> Path:
+    """从 app.state 提取 workspace 目录。"""
+    path = getattr(request.app.state, "workspace_dir", None)
+    if path is None:
+        raise RuntimeError("workspace_dir not initialized")
+    return path
+
+
+def _store(request: Request) -> SqliteStore:
+    """从 app.state 提取 SQLite store。"""
+    store = getattr(request.app.state, "store", None)
+    if store is None:
+        raise RuntimeError("store not initialized")
+    return store
+
+
+def _tools(request: Request) -> ToolRegistry:
+    """从 app.state 提取 ToolRegistry。"""
+    tools = getattr(request.app.state, "tools", None)
+    if tools is None:
+        raise RuntimeError("tools not initialized")
+    return tools
+
+
+# ---------------------------------------------------------------------------
+# Security helpers
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_SESSION_ID_RE = _re.compile(r"^[\w-]{1,64}$")
+
+
+def _validate_session_id(session_id: str) -> None:
+    """校验 session_id 格式,防止注入非法字符。"""
+    if not _SESSION_ID_RE.match(session_id):
+        raise ValueError(
+            f"invalid session_id: {session_id!r}. "
+            "Must be 1-64 chars of [A-Za-z0-9_-]."
+        )

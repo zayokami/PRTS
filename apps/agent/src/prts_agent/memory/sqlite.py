@@ -117,7 +117,15 @@ class SqliteStore:
         return self._db_path
 
     async def _set_pragmas(self, conn: aiosqlite.Connection) -> None:
+        """设置连接级 PRAGMA。
+
+        WAL / synchronous 是持久化到库文件的,ensure_schema 里已设过,
+        运行时连接只需设 foreign_keys + busy_timeout。
+        """
         for pragma in _PRAGMAS:
+            # journal_mode / synchronous 持久化,跳过后续重复执行
+            if pragma.startswith(("PRAGMA journal_mode", "PRAGMA synchronous")):
+                continue
             await conn.execute(pragma)
 
     async def ensure_schema(self) -> None:

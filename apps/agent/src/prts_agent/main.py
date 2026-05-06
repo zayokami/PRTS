@@ -143,6 +143,44 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
                 logger.exception("embedding_client close failed")
 
 
+# ---------------------------------------------------------------------------
+# 简单内存限流器:基于客户端 IP 的滑动窗口
+# ---------------------------------------------------------------------------
+from collections import defaultdict
+from time import time as _time
+
+_RATE_LIMIT_WINDOW = 60.0  # 60 秒窗口
+_RATE_LIMIT_MAX = 120      # 每窗口最多 120 请求(约 2 req/s 均值)
+_rate_limit_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request, call_next):
+    """基于 IP 的简单滑动窗口限流。超限返回 429 Too Many Requests。"""
+    # 只限流外部请求(跳过本地健康检查)
+    client_host = request.client.host if request.client else ""
+    if client_host in ("127.0.0.1", "::1") and request.url.path == "/health":
+        return await call_next(request)
+
+    now = _time()
+    bucket = _rate_limit_buckets[client_host]
+    # 清理过期时间戳
+    cutoff = now - _RATE_LIMIT_WINDOW
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+
+    if len(bucket) >= _RATE_LIMIT_MAX:
+        from starlette.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=429,
+            content={"error": "rate limit exceeded", "retry_after": int(_RATE_LIMIT_WINDOW)},
+        )
+
+    bucket.append(now)
+    return await call_next(request)
+
+
 app = FastAPI(title="PRTS Agent", version="0.1.0", lifespan=lifespan)
 app.include_router(agent_router)
 
