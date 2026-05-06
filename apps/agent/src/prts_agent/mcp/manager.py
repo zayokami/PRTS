@@ -140,7 +140,7 @@ class MCPManager:
         self._registry = registry
         self._parent_stack = parent_stack
         self._states: dict[str, MCPServerState] = {}
-        # P4+: 供 health check 与单 server 重启使用
+        # Track sessions per server for health checks and individual restarts
         self._sessions: dict[str, Any] = {}
         self._stacks: dict[str, AsyncExitStack] = {}
         self._configs: dict[str, MCPServerConfig] = {}

@@ -32,7 +32,7 @@ class DynamicBudget:
         self._llm = llm
         self._store = store
         self._history: deque[TokenUsage] = deque(maxlen=_MAX_HISTORY)
-        # P9: 启动时异步加载历史
+        # Async load budget history from SQLite on startup for cross-session learning
         if store is not None:
             try:
                 import asyncio

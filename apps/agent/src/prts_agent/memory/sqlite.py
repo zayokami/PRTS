@@ -263,7 +263,7 @@ class SqliteStore:
             out.append(StoredMessage(role=role, content=content, created_at=created_at, meta=meta))
         return out
 
-    # ---------- P8: 中期记忆层 (summaries) ---------- #
+    # ---------- Mid-term memory layer (summaries) ---------- #
 
     async def save_summary(
         self,
@@ -382,7 +382,7 @@ class SqliteStore:
             return len(to_delete)
 
     # ------------------------------------------------------------------
-    # P9: Token 校准缓存持久化
+    # Token calibration cache persistence
     # ------------------------------------------------------------------
 
     async def save_calibration(
@@ -440,7 +440,7 @@ class SqliteStore:
             return result
 
     # ------------------------------------------------------------------
-    # P9: 预算历史持久化
+    # Budget history persistence
     # ------------------------------------------------------------------
 
     async def save_budget_usage(

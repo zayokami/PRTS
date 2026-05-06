@@ -194,7 +194,7 @@ async def health() -> dict[str, object]:
     mcp_manager = getattr(app.state, "mcp_manager", None)
     mcp_states = mcp_manager.states() if mcp_manager else []
 
-    # P8: 上下文管理状态
+    # Context management stats for health endpoint
     context_mode = os.getenv("PRTS_CONTEXT_MODE", "smart")
     summary_interval = int(os.getenv("PRTS_SUMMARY_INTERVAL", "10"))
     agent_loop = getattr(app.state, "agent_loop", None)

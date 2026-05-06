@@ -212,7 +212,7 @@ class AnthropicLlmClient(LlmClient):
                         stop_reason = sr
 
                 elif etype == "message_stop":
-                    # P8: Anthropic 在 message_stop 时提供 usage
+                    # Anthropic provides usage in message_stop event
                     usage = getattr(event, "usage", None)
                     if usage:
                         input_tokens = getattr(usage, "input_tokens", 0)

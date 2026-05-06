@@ -219,11 +219,11 @@ class AgentLoop:
         # 2. 审计日志
         self._hooks.register_post(_log_tool_execution)
 
-        # P9: 初始化 tokenizer 校准持久化
+        # Initialize tokenizer calibration persistence (SQLite-backed)
         set_calibration_store(store)
 
-        # P8: 初始化三层记忆组件
-        # P9: DynamicBudget 注入 store 以持久化历史
+        # Initialize three-tier memory components (short-term + mid-term + long-term)
+        # DynamicBudget persists history to SQLite for cross-session learning
         self._budget = DynamicBudget(llm, store=store)
         self._summarizer = DialogueSummarizer(llm)
         self._context_manager = ContextManager(
@@ -267,7 +267,7 @@ class AgentLoop:
 
         try:
             for iteration in range(MAX_ITERATIONS):
-                # P8: 使用 ContextManager 组装三层记忆上下文
+                # Build context with three-tier memory assembly (short/mid/long-term)
                 messages = await self._context_manager.build_context(
                     session_id, user_content, system_prompt
                 )
@@ -298,7 +298,7 @@ class AgentLoop:
                                 {"id": evt.id, "name": evt.name, "arguments": evt.arguments}
                             )
                         elif isinstance(evt, UsageEvent):
-                            # P8: 记录 usage 用于动态预算校准
+                            # Record usage for dynamic budget calibration and persistence
                             self._budget.record(evt.usage)
                             logger.debug(
                                 "usage recorded: prompt=%d completion=%d",

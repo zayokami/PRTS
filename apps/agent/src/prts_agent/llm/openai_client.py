@@ -64,7 +64,7 @@ class OpenAILlmClient(LlmClient):
         finish_reason: str | None = None
 
         async for chunk in stream:
-            # P8: 解析 usage —— 不同 provider 位置不同:
+            # Parse usage — location varies by provider:
             # - 标准 OpenAI: chunk.usage (最后一个 chunk)
             # - Groq: chunk.x_groq.usage
             # - 某些代理: chunk.choices[0].usage

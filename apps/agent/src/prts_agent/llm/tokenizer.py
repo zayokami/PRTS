@@ -326,7 +326,7 @@ def count_messages_tokens(messages: list[dict]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# P8: 结合模型自报告校准 heuristic 计数
+# Token calibration: track discrepancy between heuristic and model-reported counts
 # ---------------------------------------------------------------------------
 
 # 记录最近 N 次 heuristic vs actual 的误差比例,用于渐进校准。
@@ -337,7 +337,7 @@ _MAX_CALIBRATION_MODELS = 50
 _calibration_history: collections.OrderedDict[str, collections.deque[tuple[int, int]]] = (
     collections.OrderedDict()
 )
-# P9: 持久化存储引用(由外部在启动时注入)
+# SQLite store reference for persisting calibration history (injected at startup)
 _calibration_store: Any = None
 
 
@@ -372,7 +372,7 @@ def record_usage_discrepancy(model: str, heuristic_tokens: int, actual_tokens: i
         _calibration_history[model] = collections.deque(maxlen=_MAX_CALIBRATION_HISTORY)
     _calibration_history[model].append((heuristic_tokens, actual_tokens))
 
-    # P9: 异步持久化(不阻塞主流程)
+    # Async persist to SQLite (fire-and-forget, non-blocking)
     if _calibration_store is not None:
         try:
             import asyncio
