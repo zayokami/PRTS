@@ -132,6 +132,28 @@ class MCPReloadResponse(BaseModel):
     error: str | None = None
 
 
+class FsEventRequest(BaseModel):
+    """文件系统事件请求(当前版本为空,预留扩展)。"""
+
+    pass
+
+
+class FsEventResponse(BaseModel):
+    reloaded: bool
+    tasks: list[TaskInfo]
+    errors: list[str]
+
+
+class CronEventRequest(BaseModel):
+    task_name: str
+
+
+class CronEventResponse(BaseModel):
+    ok: bool
+    error: str | None = None
+    result: Any | None = None
+
+
 @router.post("/mcp/reload", response_model=MCPReloadResponse)
 async def reload_mcp_servers(request: Request) -> MCPReloadResponse:
     """热重载:停止所有 MCP server,重新加载 workspace/mcp.json 并启动。

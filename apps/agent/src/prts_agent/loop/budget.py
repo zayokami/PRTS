@@ -43,7 +43,8 @@ class DynamicBudget:
     async def _load_history(self) -> None:
         """从 SQLite 加载历史 usage。"""
         try:
-            rows = await self._store.load_budget_history(self._llm.model_name, limit=_MAX_HISTORY)
+            model_name = getattr(self._llm, "model_name", None) or getattr(self._llm, "model", "unknown")
+            rows = await self._store.load_budget_history(model_name, limit=_MAX_HISTORY)
             from ..llm.base import TokenUsage
             for prompt, completion, total in rows:
                 self._history.append(
@@ -51,7 +52,7 @@ class DynamicBudget:
                         prompt_tokens=prompt,
                         completion_tokens=completion,
                         total_tokens=total,
-                        model=self._llm.model_name,
+                        model=model_name,
                     )
                 )
             logger.info(
