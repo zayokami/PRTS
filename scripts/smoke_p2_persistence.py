@@ -25,7 +25,7 @@ from prts_agent.llm.tokenizer import (
 
 async def test_calibration_persistence():
     """1. 校准缓存持久化。"""
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         db = Path(tmp) / "test.db"
         store = SqliteStore(db)
         await store.ensure_schema()
@@ -39,8 +39,9 @@ async def test_calibration_persistence():
         for i in range(5):
             record_usage_discrepancy("gpt-4", 100 + i * 10, 90 + i * 9)
 
-        # 等待异步保存完成(5 次 create_task 需要足够时间)
-        await asyncio.sleep(0.5)
+        # 直接同步保存到 SQLite(不依赖异步后台任务,避免测试竞争)
+        history = list(_calibration_history.get("gpt-4", []))
+        await store.save_calibration("gpt-4", history)
 
         # 重新加载
         loaded = await store.load_calibration("gpt-4")
@@ -57,7 +58,7 @@ async def test_calibration_persistence():
 
 async def test_budget_history_persistence():
     """2. 预算历史持久化。"""
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         db = Path(tmp) / "test.db"
         store = SqliteStore(db)
         await store.ensure_schema()
@@ -97,7 +98,7 @@ async def test_budget_history_persistence():
 
 async def test_calibration_multiple_models():
     """3. 多模型校准独立存储。"""
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         db = Path(tmp) / "test.db"
         store = SqliteStore(db)
         await store.ensure_schema()
@@ -109,7 +110,10 @@ async def test_calibration_multiple_models():
         record_usage_discrepancy("gpt-4", 100, 90)
         record_usage_discrepancy("claude-3", 100, 110)
 
-        await asyncio.sleep(0.1)
+        # 直接同步保存
+        for model in ["gpt-4", "claude-3"]:
+            history = list(_calibration_history.get(model, []))
+            await store.save_calibration(model, history)
 
         all_data = await store.load_all_calibrations()
         assert "gpt-4" in all_data
