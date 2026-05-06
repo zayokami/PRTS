@@ -48,7 +48,14 @@ from ..memory import SqliteStore
 from ..memory.sqlite import PendingMessage
 from ..memory.summarizer import DialogueSummarizer
 from ..runtime import bind_notify_queue, unbind_notify_queue
-from ..tools import ToolRegistry
+from ..tools import (
+    HookedToolRegistry,
+    ToolHooks,
+    ToolPermissionDenied,
+    ToolRegistry,
+    ToolTimeoutError,
+    build_default_permission_engine,
+)
 
 from .budget import DynamicBudget
 from .context_manager import ContextManager
@@ -165,6 +172,32 @@ def _truncate_for_llm(serialized: str) -> str:
     )
 
 
+# ---- Tool Hook: 审计日志 ----
+
+async def _log_tool_execution(invocation, result, duration_ms):
+    """post-tool hook：记录每次工具调用的耗时与结果摘要。"""
+    # 结果摘要：如果是字符串直接取前 200 字符，否则序列化后截取
+    if isinstance(result, str):
+        summary = result[:200]
+    else:
+        try:
+            summary = json.dumps(result, ensure_ascii=False, default=str)[:200]
+        except (TypeError, ValueError):
+            summary = str(result)[:200]
+
+    logger.info(
+        "tool=%s source=%s session=%s channel=%s duration=%.1fms "
+        "args_keys=%s result_summary=%s",
+        invocation.name,
+        invocation.source,
+        invocation.session_id,
+        invocation.channel,
+        duration_ms,
+        list(invocation.arguments.keys()),
+        summary,
+    )
+
+
 class AgentLoop:
     def __init__(
         self,
@@ -177,6 +210,14 @@ class AgentLoop:
         self._llm = llm
         self._tools = tools
         self._embedding = embedding_client
+
+        # ---- Tool Hooks ----
+        self._hooks = ToolHooks()
+        # 1. 权限检查
+        perm_engine = build_default_permission_engine()
+        self._hooks.register_pre(perm_engine.check)
+        # 2. 审计日志
+        self._hooks.register_post(_log_tool_execution)
 
         # P8: 初始化三层记忆组件
         self._budget = DynamicBudget(llm)
@@ -319,11 +360,31 @@ class AgentLoop:
                         },
                     }
 
+                # 每次 converse 动态创建 HookedToolRegistry 以传入当前 session/channel
+                hooked_tools = HookedToolRegistry(
+                    inner=self._tools,
+                    hooks=self._hooks,
+                    session_id=session_id,
+                    channel=channel,
+                    timeout_seconds=60.0,  # 单个工具最多 60 秒
+                    max_concurrent=4,      # 最多同时执行 4 个工具
+                )
+
                 tool_outcomes: list[tuple[dict[str, Any], Any, bool]] = []
                 for call in pending_calls:
                     is_error = False
                     try:
-                        result = await self._tools.invoke(call["name"], call["arguments"])
+                        result = await hooked_tools.invoke(
+                            call["name"], call["arguments"]
+                        )
+                    except ToolPermissionDenied as exc:
+                        logger.warning("tool %s denied: %s", call["name"], exc)
+                        result = {"error": str(exc), "type": "ToolPermissionDenied"}
+                        is_error = True
+                    except ToolTimeoutError as exc:
+                        logger.error("tool %s timed out: %s", call["name"], exc)
+                        result = {"error": str(exc), "type": "ToolTimeoutError"}
+                        is_error = True
                     except Exception as exc:  # noqa: BLE001
                         logger.exception("tool %s failed", call["name"])
                         result = {"error": str(exc), "type": type(exc).__name__}
