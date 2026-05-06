@@ -129,6 +129,18 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         # 先关 MCP(可能要等子进程优雅退出),再清 SDK runtime 引用
         await parent_stack.aclose()
         prts_runtime.set_runtime(None)
+        # 关闭 LLM / embedding HTTP 客户端,释放连接池。长时间运行后不关闭
+        # 会导致底层 socket 累积,最终触发 "too many open files" 或请求失败。
+        if llm_client is not None:
+            try:
+                await llm_client.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("llm_client close failed")
+        if embedding_client is not None:
+            try:
+                await embedding_client.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("embedding_client close failed")
 
 
 app = FastAPI(title="PRTS Agent", version="0.1.0", lifespan=lifespan)

@@ -132,6 +132,10 @@ class AnthropicLlmClient(LlmClient):
     def model(self) -> str:
         return self._model
 
+    async def close(self) -> None:
+        """关闭底层 HTTP 连接池。Agent shutdown / reload 时调用,防连接泄漏。"""
+        await self._client.close()
+
     async def stream_chat(
         self,
         messages: list[ChatMessage],

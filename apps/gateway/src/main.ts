@@ -152,6 +152,11 @@ app.get<{ Querystring: { session_id?: string } }>(
       let sawDone = false;
       const ac = new AbortController();
       inflight = ac;
+      // 5 分钟兜底超时:LLM 生成不可能无限等,超时时自动 abort 释放连接。
+      const FETCH_TIMEOUT_MS = 300_000;
+      const timeoutId = setTimeout(() => {
+        try { ac.abort(); } catch { /* ignore */ }
+      }, FETCH_TIMEOUT_MS);
 
       try {
         const resp = await fetch(`${AGENT_URL}/agent/v1/converse`, {
@@ -240,6 +245,7 @@ app.get<{ Querystring: { session_id?: string } }>(
         send({ type: "error", message: err instanceof Error ? err.message : String(err) });
         if (!sawDone) send({ type: "done", stop_reason: "error" });
       } finally {
+        clearTimeout(timeoutId);
         if (inflight === ac) inflight = null;
         busy = false;
       }

@@ -41,6 +41,10 @@ class EmbeddingClient:
         self._model = model or os.getenv("EMBEDDING_MODEL", _DEFAULT_MODEL)
         self._client = httpx.AsyncClient(timeout=30.0)
 
+    async def close(self) -> None:
+        """关闭底层 HTTP 连接池。Agent shutdown / reload 时调用,防连接泄漏。"""
+        await self._client.aclose()
+
     async def embed(self, text: str) -> list[float]:
         """把单条文本转成 float 向量。"""
         url = f"{self._base_url}/embeddings"

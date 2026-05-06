@@ -282,6 +282,11 @@ export function createTelegramBot(agentUrl: string, token: string, workspaceDir:
 
     const ac = new AbortController();
     inflight.set(chatId, ac);
+    // 5 分钟兜底超时:LLM 生成不可能无限等,超时时自动 abort 释放连接。
+    const FETCH_TIMEOUT_MS = 300_000;
+    const timeoutId = setTimeout(() => {
+      try { ac.abort(); } catch { /* ignore */ }
+    }, FETCH_TIMEOUT_MS);
 
     try {
       const reply = await fetchAgentReply(agentUrl, chatId, content, ac);
@@ -292,6 +297,7 @@ export function createTelegramBot(agentUrl: string, token: string, workspaceDir:
       const msg = err instanceof Error ? err.message : String(err);
       await bot.api.sendMessage(chatId, `PRTS 处理出错: ${msg}`);
     } finally {
+      clearTimeout(timeoutId);
       if (inflight.get(chatId) === ac) {
         inflight.delete(chatId);
       }
