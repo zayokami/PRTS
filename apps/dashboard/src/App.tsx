@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { memo, useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   Plus,
   MessageSquare,
@@ -12,6 +12,8 @@ import {
   Copy,
   Check,
   RotateCcw,
+  Trash2,
+  Pencil,
 } from "lucide-react";
 
 type Role = "user" | "assistant" | "system";
@@ -19,6 +21,17 @@ interface Msg {
   role: Role;
   content: string;
   kind?: "text" | "tool" | "notify";
+  ts: number;
+}
+
+interface SessionInfo {
+  id: string;
+  channel: string;
+  user_ref: string | null;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
 }
 
 type Frame =
@@ -51,6 +64,21 @@ function nextRetryDelay(attempt: number): number {
   return Math.min(INITIAL_RETRY_MS * Math.pow(2, attempt), MAX_RETRY_MS) * jitter;
 }
 
+function relativeTime(iso: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const now = Date.now();
+  const diff = now - d.getTime();
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return "刚刚";
+  if (min < 60) return `${min} 分钟前`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr} 小时前`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day} 天前`;
+  return d.toLocaleDateString("zh-CN");
+}
+
 /* ------------------------------------------------------------------ */
 /*  Sidebar                                                           */
 /* ------------------------------------------------------------------ */
@@ -58,13 +86,38 @@ function Sidebar({
   isOpen,
   onToggle,
   onNewChat,
+  sessions,
   currentSessionId,
+  onSwitchSession,
+  onDeleteSession,
+  onRenameSession,
 }: {
   isOpen: boolean;
   onToggle: () => void;
   onNewChat: () => void;
+  sessions: SessionInfo[];
   currentSessionId: string;
+  onSwitchSession: (id: string) => void;
+  onDeleteSession: (id: string) => void;
+  onRenameSession: (id: string, title: string) => void;
 }) {
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState("");
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+
+  const startEdit = (s: SessionInfo) => {
+    setEditingId(s.id);
+    setEditTitle(s.title || s.id.slice(0, 8));
+  };
+
+  const commitEdit = () => {
+    if (editingId && editTitle.trim()) {
+      onRenameSession(editingId, editTitle.trim());
+    }
+    setEditingId(null);
+    setEditTitle("");
+  };
+
   return (
     <aside
       style={{
@@ -119,25 +172,127 @@ function Sidebar({
       </div>
 
       <div style={{ flex: 1, overflowY: "auto", padding: "0 12px" }}>
-        <div
-          style={{
-            padding: "10px 12px",
-            borderRadius: 8,
-            background: "#ececf1",
-            fontSize: 14,
-            color: "#1a1a1a",
-            cursor: "pointer",
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            marginBottom: 4,
-          }}
-        >
-          <MessageSquare size={16} />
-          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {currentSessionId ? currentSessionId.slice(0, 16) : "当前会话"}
-          </span>
-        </div>
+        {sessions.length === 0 && (
+          <div style={{ padding: "20px 12px", fontSize: 13, color: "#999", textAlign: "center" }}>
+            暂无历史会话
+          </div>
+        )}
+        {sessions.map((s) => {
+          const isCurrent = s.id === currentSessionId;
+          const isEditing = editingId === s.id;
+          return (
+            <div
+              key={s.id}
+              onMouseEnter={() => setHoveredId(s.id)}
+              onMouseLeave={() => setHoveredId(null)}
+              onClick={() => !isEditing && onSwitchSession(s.id)}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 8,
+                background: isCurrent ? "#ececf1" : "transparent",
+                fontSize: 14,
+                color: "#1a1a1a",
+                cursor: isEditing ? "default" : "pointer",
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                marginBottom: 2,
+                position: "relative",
+                transition: "background 0.1s",
+              }}
+            >
+              <MessageSquare size={16} style={{ flexShrink: 0, opacity: 0.6 }} />
+              {isEditing ? (
+                <input
+                  autoFocus
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                  onBlur={commitEdit}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitEdit();
+                    if (e.key === "Escape") {
+                      setEditingId(null);
+                      setEditTitle("");
+                    }
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  style={{
+                    flex: 1,
+                    border: "1px solid #10a37f",
+                    borderRadius: 4,
+                    padding: "2px 6px",
+                    fontSize: 13,
+                    background: "#fff",
+                    color: "#1a1a1a",
+                    outline: "none",
+                  }}
+                />
+              ) : (
+                <span
+                  style={{
+                    flex: 1,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    startEdit(s);
+                  }}
+                >
+                  {s.title || s.id.slice(0, 16)}
+                </span>
+              )}
+
+              {!isEditing && hoveredId === s.id && (
+                <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      startEdit(s);
+                    }}
+                    style={{
+                      padding: 2,
+                      border: "none",
+                      background: "transparent",
+                      cursor: "pointer",
+                      color: "#999",
+                      display: "flex",
+                    }}
+                    title="重命名"
+                  >
+                    <Pencil size={13} />
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (confirm(`删除会话「${s.title || s.id.slice(0, 16)}」？`)) {
+                        onDeleteSession(s.id);
+                      }
+                    }}
+                    style={{
+                      padding: 2,
+                      border: "none",
+                      background: "transparent",
+                      cursor: "pointer",
+                      color: "#999",
+                      display: "flex",
+                    }}
+                    title="删除"
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              )}
+
+              {!isEditing && hoveredId !== s.id && (
+                <span style={{ fontSize: 11, color: "#999", flexShrink: 0 }}>
+                  {relativeTime(s.updated_at)}
+                </span>
+              )}
+            </div>
+          );
+        })}
       </div>
 
       <div style={{ padding: 12, borderTop: "1px solid #e5e5e5" }}>
@@ -165,10 +320,9 @@ function Sidebar({
 }
 
 /* ------------------------------------------------------------------ */
-/*  Markdown-like simple renderer                                     */
+/*  Message content renderer                                          */
 /* ------------------------------------------------------------------ */
-function ChatMessageContent({ content }: { content: string }) {
-  // Simple newline-to-line rendering (avoid <p> nesting issues)
+const ChatMessageContent = memo(function ChatMessageContent({ content }: { content: string }) {
   const lines = content.split("\n");
   return (
     <div style={{ lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
@@ -179,7 +333,7 @@ function ChatMessageContent({ content }: { content: string }) {
       ))}
     </div>
   );
-}
+});
 
 /* ------------------------------------------------------------------ */
 /*  App                                                               */
@@ -193,6 +347,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [copiedId, setCopiedId] = useState<number | null>(null);
   const [hoveredMsgId, setHoveredMsgId] = useState<number | null>(null);
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -201,6 +356,19 @@ export default function App() {
   const retryCountRef = useRef(0);
   const shouldReconnectRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const historyLoadingRef = useRef(false);
+
+  const fetchSessions = useCallback(async () => {
+    try {
+      const r = await fetch("/api/sessions?limit=50");
+      if (r.ok) {
+        const j = await r.json();
+        setSessions(j.sessions || []);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const pushMessage = (msg: Msg) => {
     setMessages((prev) => {
@@ -246,24 +414,32 @@ export default function App() {
         const sid = frame.session_id;
         setSessionId(sid);
         localStorage.setItem(SESSION_KEY, sid);
+        setMessages([]);
+        historyLoadingRef.current = true;
         fetch(`/api/sessions/${encodeURIComponent(sid)}/history`)
           .then((r) => (r.ok ? r.json() : { messages: [] }))
           .then((j: { messages: { role: Role; content: string }[] }) => {
             const seed = (j.messages ?? []).filter(
               (m) => m.role === "user" || m.role === "assistant"
             );
-            setMessages(seed.map((m) => ({ role: m.role, content: m.content, kind: "text" })));
+            setMessages(seed.map((m) => ({ role: m.role, content: m.content, kind: "text", ts: Date.now() })));
+            historyLoadingRef.current = false;
             setStatus("ready");
+            fetchSessions();
           })
-          .catch(() => setStatus("ready"));
+          .catch(() => {
+            historyLoadingRef.current = false;
+            setStatus("ready");
+          });
       } else if (frame.type === "token") {
+        if (historyLoadingRef.current) return;
         setMessages((prev) => {
           const next = [...prev];
           const last = next[next.length - 1];
           if (last && last.role === "assistant" && last.kind === "text") {
             next[next.length - 1] = { ...last, content: last.content + frame.text };
           } else {
-            next.push({ role: "assistant", content: frame.text, kind: "text" });
+            next.push({ role: "assistant", content: frame.text, kind: "text", ts: Date.now() });
           }
           return next;
         });
@@ -272,18 +448,20 @@ export default function App() {
           role: "system",
           kind: "tool",
           content: `调用 ${frame.name}(${summarize(frame.arguments, 160)})`,
+          ts: Date.now(),
         });
       } else if (frame.type === "tool_result") {
         const isErr = frame.error !== undefined && frame.error !== null;
         const label = isErr ? `${frame.name} 失败` : `${frame.name} 返回`;
         const body = summarize(isErr ? frame.error : frame.result, 320);
-        pushMessage({ role: "system", kind: "tool", content: `${label}: ${body}` });
+        pushMessage({ role: "system", kind: "tool", content: `${label}: ${body}`, ts: Date.now() });
       } else if (frame.type === "notify") {
-        pushMessage({ role: "system", kind: "notify", content: frame.message });
+        pushMessage({ role: "system", kind: "notify", content: frame.message, ts: Date.now() });
       } else if (frame.type === "done") {
         setStatus("ready");
+        fetchSessions();
       } else if (frame.type === "error") {
-        pushMessage({ role: "assistant", content: `[error] ${frame.message}`, kind: "text" });
+        pushMessage({ role: "assistant", content: `[error] ${frame.message}`, kind: "text", ts: Date.now() });
         setStatus("ready");
       }
     };
@@ -318,6 +496,7 @@ export default function App() {
   useEffect(() => {
     shouldReconnectRef.current = true;
     connect();
+    fetchSessions();
     return () => {
       shouldReconnectRef.current = false;
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
@@ -345,16 +524,63 @@ export default function App() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
     ws.send(JSON.stringify({ type: "user", content: text }));
-    pushMessage({ role: "user", content: text, kind: "text" });
+    pushMessage({ role: "user", content: text, kind: "text", ts: Date.now() });
     setInput("");
     setStatus("streaming");
-    // Reset textarea height
     if (textareaRef.current) textareaRef.current.style.height = "auto";
   };
 
   const newSession = () => {
     localStorage.removeItem(SESSION_KEY);
-    location.reload();
+    setMessages([]);
+    setSessionId("");
+    shouldReconnectRef.current = false;
+    if (wsRef.current) {
+      try { wsRef.current.close(); } catch { /* ignore */ }
+      wsRef.current = null;
+    }
+    shouldReconnectRef.current = true;
+    connect();
+  };
+
+  const switchSession = (id: string) => {
+    if (id === sessionId) return;
+    localStorage.setItem(SESSION_KEY, id);
+    setMessages([]);
+    setSessionId(id);
+    shouldReconnectRef.current = false;
+    if (wsRef.current) {
+      try { wsRef.current.close(); } catch { /* ignore */ }
+      wsRef.current = null;
+    }
+    shouldReconnectRef.current = true;
+    setStatus("connecting");
+    connect();
+  };
+
+  const deleteSession = async (id: string) => {
+    try {
+      await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (id === sessionId) {
+        newSession();
+      }
+      fetchSessions();
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const renameSession = async (id: string, title: string) => {
+    try {
+      await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      fetchSessions();
+    } catch {
+      /* ignore */
+    }
   };
 
   const copyMessage = (idx: number, text: string) => {
@@ -368,17 +594,18 @@ export default function App() {
 
   return (
     <div style={{ display: "flex", height: "100vh", fontFamily: "'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif", background: "#fff" }}>
-      {/* Sidebar */}
       <Sidebar
         isOpen={sidebarOpen}
         onToggle={() => setSidebarOpen((s) => !s)}
         onNewChat={newSession}
+        sessions={sessions}
         currentSessionId={sessionId}
+        onSwitchSession={switchSession}
+        onDeleteSession={deleteSession}
+        onRenameSession={renameSession}
       />
 
-      {/* Main */}
       <main style={{ flex: 1, display: "flex", flexDirection: "column", position: "relative", overflow: "hidden" }}>
-        {/* Top Nav */}
         <header
           style={{
             height: 48,
@@ -431,7 +658,6 @@ export default function App() {
             <ChevronDown size={14} />
           </button>
 
-          {/* Connection status dot */}
           <div
             style={{
               position: "absolute",
@@ -465,7 +691,6 @@ export default function App() {
           </div>
         </header>
 
-        {/* Chat Area */}
         <div
           ref={listRef}
           style={{
@@ -476,7 +701,6 @@ export default function App() {
           }}
         >
           {isEmpty ? (
-            /* Empty state */
             <div
               style={{
                 flex: 1,
@@ -496,10 +720,9 @@ export default function App() {
                   textAlign: "center",
                 }}
               >
-                你好，我是PRTS。
+                你今天在想些什么？
               </h1>
 
-              {/* Suggestion chips */}
               <div
                 style={{
                   display: "flex",
@@ -547,16 +770,16 @@ export default function App() {
               </div>
             </div>
           ) : (
-            /* Messages */
             <div style={{ flex: 1, padding: "20px 0" }}>
               {messages.map((m, i) => {
                 const isUser = m.role === "user";
                 const isSystem = m.role === "system";
+                const msgKey = `${m.role}-${m.ts}-${i}`;
 
                 if (isSystem) {
                   return (
                     <div
-                      key={i}
+                      key={msgKey}
                       style={{
                         display: "flex",
                         justifyContent: "center",
@@ -590,7 +813,7 @@ export default function App() {
 
                 return (
                   <div
-                    key={i}
+                    key={msgKey}
                     style={{
                       display: "flex",
                       justifyContent: isUser ? "flex-end" : "flex-start",
@@ -605,7 +828,6 @@ export default function App() {
                         flexDirection: isUser ? "row-reverse" : "row",
                       }}
                     >
-                      {/* Avatar */}
                       <div
                         style={{
                           width: 28,
@@ -624,7 +846,6 @@ export default function App() {
                         {isUser ? "你" : "AI"}
                       </div>
 
-                      {/* Bubble */}
                       <div
                         style={{
                           background: isUser ? "#f5f5f5" : "#fff",
@@ -638,7 +859,6 @@ export default function App() {
                       >
                         <ChatMessageContent content={m.content} />
 
-                        {/* Actions */}
                         <div
                           style={{
                             display: "flex",
@@ -669,9 +889,6 @@ export default function App() {
                           </button>
                           {!isUser && (
                             <button
-                              onClick={() => {
-                                /* regenerate - would need backend support */
-                              }}
                               style={{
                                 padding: "4px 8px",
                                 borderRadius: 6,
@@ -700,7 +917,6 @@ export default function App() {
           )}
         </div>
 
-        {/* Input Area */}
         <div
           style={{
             padding: "16px 20px 24px",
@@ -760,7 +976,7 @@ export default function App() {
                     send(e);
                   }
                 }}
-                placeholder="输入以开始对话……"
+                placeholder="有问题，尽管问"
                 disabled={status !== "ready"}
                 rows={1}
                 style={{
@@ -823,7 +1039,7 @@ export default function App() {
                 color: "#999",
               }}
             >
-              PRTS生成的内容仅供参考，请自行验证。
+              PRTS 可能会生成不准确的信息，请验证重要信息。
             </div>
           </form>
         </div>
