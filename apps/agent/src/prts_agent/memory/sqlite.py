@@ -31,9 +31,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     id          TEXT PRIMARY KEY,
     channel     TEXT NOT NULL,
     user_ref    TEXT,
+    title       TEXT,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
 CREATE TABLE IF NOT EXISTS messages (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  TEXT NOT NULL REFERENCES sessions(id),
@@ -107,6 +110,7 @@ def _now() -> str:
 
 @dataclass(frozen=True)
 class StoredMessage:
+    id: int
     role: Role
     content: str
     created_at: str
@@ -150,8 +154,6 @@ class SqliteStore:
             await self._set_pragmas(conn)
             await conn.executescript(SCHEMA)
             # P2 → P3 迁移:老库 messages 没有 meta 列。
-            # 多进程同时启动时,两个 Agent 都做这步会让其中一个撞 "duplicate column"。
-            # 重新查 PRAGMA 后再判断 + 用 try 兜底,确保多进程下幂等。
             cursor = await conn.execute("PRAGMA table_info(messages)")
             cols = {row[1] for row in await cursor.fetchall()}
             if "meta" not in cols:
@@ -159,11 +161,23 @@ class SqliteStore:
                 try:
                     await conn.execute("ALTER TABLE messages ADD COLUMN meta TEXT")
                 except aiosqlite.OperationalError as exc:
-                    # 多进程并发迁移 — 已经被对面进程加上了
                     if "duplicate column" in str(exc).lower():
                         logger.info("meta column already added by concurrent process")
                     else:
                         raise
+            # 迁移:老库 sessions 没有 title / message_count 列
+            cursor = await conn.execute("PRAGMA table_info(sessions)")
+            s_cols = {row[1] for row in await cursor.fetchall()}
+            for col_name, col_def in [("title", "TEXT"), ("message_count", "INTEGER NOT NULL DEFAULT 0")]:
+                if col_name not in s_cols:
+                    logger.info("migrating sessions table: ADD COLUMN %s", col_name)
+                    try:
+                        await conn.execute(f"ALTER TABLE sessions ADD COLUMN {col_name} {col_def}")
+                    except aiosqlite.OperationalError as exc:
+                        if "duplicate column" in str(exc).lower():
+                            pass
+                        else:
+                            raise
             await conn.commit()
 
     async def ensure_session(self, session_id: str, channel: str = "web", user_ref: str | None = None) -> None:
@@ -171,8 +185,8 @@ class SqliteStore:
             await self._set_pragmas(conn)
             await conn.execute(
                 """
-                INSERT INTO sessions (id, channel, user_ref, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO sessions (id, channel, user_ref, created_at, updated_at, message_count)
+                VALUES (?, ?, ?, ?, ?, 0)
                 ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at
                 """,
                 (session_id, channel, user_ref, _now(), _now()),
@@ -219,8 +233,8 @@ class SqliteStore:
                     assert cursor.lastrowid is not None
                     ids.append(cursor.lastrowid)
                 await conn.execute(
-                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
-                    (_now(), session_id),
+                    "UPDATE sessions SET updated_at = ?, message_count = message_count + ? WHERE id = ?",
+                    (_now(), len(msgs), session_id),
                 )
                 await conn.commit()
             except Exception:
@@ -242,7 +256,7 @@ class SqliteStore:
             await self._set_pragmas(conn)
             if limit is None:
                 cursor = await conn.execute(
-                    "SELECT role, content, meta, created_at FROM messages "
+                    "SELECT id, role, content, meta, created_at FROM messages "
                     "WHERE session_id = ? ORDER BY id ASC",
                     (session_id,),
                 )
@@ -250,7 +264,7 @@ class SqliteStore:
             else:
                 # 取最近 N 条,然后再翻回时间正序
                 cursor = await conn.execute(
-                    "SELECT role, content, meta, created_at FROM messages "
+                    "SELECT id, role, content, meta, created_at FROM messages "
                     "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
                     (session_id, limit),
                 )
@@ -258,9 +272,9 @@ class SqliteStore:
                 rows = list(reversed(tail))
 
         out: list[StoredMessage] = []
-        for role, content, meta_text, created_at in rows:
+        for mid, role, content, meta_text, created_at in rows:
             meta = json.loads(meta_text) if meta_text else {}
-            out.append(StoredMessage(role=role, content=content, created_at=created_at, meta=meta))
+            out.append(StoredMessage(id=mid, role=role, content=content, created_at=created_at, meta=meta))
         return out
 
     # ---------- Mid-term memory layer (summaries) ---------- #
@@ -508,6 +522,62 @@ class SqliteStore:
                 )
                 await conn.commit()
             return len(to_delete)
+
+    # ---------- Session management ---------- #
+
+    async def list_sessions(
+        self,
+        channel: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """按 updated_at 降序返回会话列表。"""
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            if channel:
+                cursor = await conn.execute(
+                    "SELECT id, channel, user_ref, title, created_at, updated_at, message_count "
+                    "FROM sessions WHERE channel = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (channel, limit, offset),
+                )
+            else:
+                cursor = await conn.execute(
+                    "SELECT id, channel, user_ref, title, created_at, updated_at, message_count "
+                    "FROM sessions ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                )
+            rows = await cursor.fetchall()
+        return [
+            {
+                "id": r[0], "channel": r[1], "user_ref": r[2],
+                "title": r[3], "created_at": r[4], "updated_at": r[5],
+                "message_count": r[6],
+            }
+            for r in rows
+        ]
+
+    async def delete_session(self, session_id: str) -> bool:
+        """删除会话及其所有消息和摘要。返回是否删除了行。"""
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            await conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            await conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
+            cursor = await conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            await conn.commit()
+            return cursor.rowcount > 0
+
+    async def update_session_title(self, session_id: str, title: str) -> bool:
+        """更新会话标题。返回是否更新了行。"""
+        async with aiosqlite.connect(self._db_path) as conn:
+            await self._set_pragmas(conn)
+            cursor = await conn.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?",
+                (title[:200], session_id),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
 
 
 def init_store(workspace_dir: Path | None = None) -> SqliteStore:

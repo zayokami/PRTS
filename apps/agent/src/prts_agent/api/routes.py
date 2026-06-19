@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from ..loop import AgentLoop
@@ -32,10 +32,16 @@ Role = Literal["system", "user", "assistant", "tool"]
 
 
 class ConverseRequest(BaseModel):
-    session_id: str
-    content: str
-    channel: str = "web"
-    user_ref: str | None = None
+    session_id: str = Field(
+        ..., min_length=1, max_length=64, pattern=r"^[\w-]+$",
+        description="会话 ID,1-64 字符,仅允许 [A-Za-z0-9_-]",
+    )
+    content: str = Field(
+        ..., min_length=1, max_length=100_000,
+        description="用户消息内容,1-100000 字符",
+    )
+    channel: str = Field("web", pattern=r"^[\w-]{1,32}$", description="来源渠道")
+    user_ref: str | None = Field(None, max_length=256, description="用户标识")
 
 
 class HistoryMessage(BaseModel):
@@ -100,6 +106,30 @@ class SummaryInfo(BaseModel):
 class SummariesResponse(BaseModel):
     session_id: str
     summaries: list[SummaryInfo]
+
+
+class SessionInfo(BaseModel):
+    id: str
+    channel: str
+    user_ref: str | None = None
+    title: str | None = None
+    created_at: str
+    updated_at: str
+    message_count: int
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionInfo]
+    total: int
+
+
+class SessionDeleteResponse(BaseModel):
+    ok: bool
+    session_id: str
+
+
+class SessionTitleUpdateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
 
 
 @router.get("/mcp/servers", response_model=MCPServersResponse)
@@ -417,6 +447,10 @@ async def get_history(
     由 P7 摘要缩略。``limit`` 范围 [1, 5000],超界会被钳制,避免单请求导致
     巨量 JSON dump 到客户端。
     """
+    try:
+        _validate_session_id(session_id)
+    except ValueError as exc:
+        return HistoryResponse(session_id=session_id, messages=[])
     # FastAPI 会校验 int 类型,但范围校验需要自己做(比如传 limit=-1
     # 会被 SQLite 报错,把会话历史搞崩 P0 状态)。
     limit = max(1, min(limit, 5000))
@@ -446,6 +480,62 @@ async def list_skills(request: Request) -> SkillsResponse:
             )
             for t in tools.all()
         ]
+    )
+
+
+@router.get("/sessions", response_model=SessionListResponse)
+async def list_sessions(
+    request: Request,
+    channel: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> SessionListResponse:
+    """按 updated_at 降序返回会话列表。"""
+    store = _store(request)
+    rows = await store.list_sessions(channel=channel, limit=limit, offset=offset)
+    return SessionListResponse(
+        sessions=[
+            SessionInfo(
+                id=r["id"], channel=r["channel"], user_ref=r.get("user_ref"),
+                title=r.get("title"), created_at=r["created_at"],
+                updated_at=r["updated_at"], message_count=r.get("message_count", 0),
+            )
+            for r in rows
+        ],
+        total=len(rows),
+    )
+
+
+@router.delete("/sessions/{session_id}", response_model=SessionDeleteResponse)
+async def delete_session(session_id: str, request: Request) -> SessionDeleteResponse:
+    """删除会话及其所有消息和摘要。"""
+    try:
+        _validate_session_id(session_id)
+    except ValueError:
+        return SessionDeleteResponse(ok=False, session_id=session_id)
+    store = _store(request)
+    deleted = await store.delete_session(session_id)
+    return SessionDeleteResponse(ok=deleted, session_id=session_id)
+
+
+@router.patch("/sessions/{session_id}", response_model=SessionInfo)
+async def update_session_title(
+    session_id: str, req: SessionTitleUpdateRequest, request: Request
+) -> SessionInfo:
+    """更新会话标题。"""
+    store = _store(request)
+    await store.update_session_title(session_id, req.title)
+    rows = await store.list_sessions(limit=200)
+    row = next((r for r in rows if r["id"] == session_id), None)
+    if row is None:
+        return SessionInfo(
+            id=session_id, channel="unknown", user_ref=None,
+            title=req.title, created_at="", updated_at="", message_count=0,
+        )
+    return SessionInfo(
+        id=row["id"], channel=row["channel"], user_ref=row.get("user_ref"),
+        title=row.get("title"), created_at=row["created_at"],
+        updated_at=row["updated_at"], message_count=row.get("message_count", 0),
     )
 
 

@@ -215,6 +215,7 @@ class AgentLoop:
         self._llm = llm
         self._tools = tools
         self._embedding = embedding_client
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
         # ---- Tool Hooks ----
         self._hooks = ToolHooks()
@@ -265,94 +266,208 @@ class AgentLoop:
         user_ref: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Yields SSE-friendly dicts: ``{"event": str, "data": dict}``。"""
-        await self._store.ensure_session(session_id, channel=channel, user_ref=user_ref)
-        await self._store.append_message(session_id, "user", user_content)
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            await self._store.ensure_session(session_id, channel=channel, user_ref=user_ref)
+            await self._store.append_message(session_id, "user", user_content)
+            await self._maybe_set_default_title(session_id, user_content)
 
-        notify_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        nq_token = bind_notify_queue(notify_queue)
+            notify_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            nq_token = bind_notify_queue(notify_queue)
 
-        # context 供 skill 脚本读取,取最近 N 条足够
-        ctx_history = await self._store.history(session_id, limit=RECENT_WINDOW)
-        ctx_token = prts_set(
-            PrtsCallContext(
-                session_id=session_id,
-                user_id=user_ref,
-                channel=channel,
-                history=[
-                    {"role": m.role, "content": m.content, "created_at": m.created_at}
-                    for m in ctx_history
-                ],
+            # context 供 skill 脚本读取,取最近 N 条足够
+            ctx_history = await self._store.history(session_id, limit=RECENT_WINDOW)
+            ctx_token = prts_set(
+                PrtsCallContext(
+                    session_id=session_id,
+                    user_id=user_ref,
+                    channel=channel,
+                    history=[
+                        {"role": m.role, "content": m.content, "created_at": m.created_at}
+                        for m in ctx_history
+                    ],
+                )
             )
-        )
 
-        try:
-            self._state_machine.start()
-            for iteration in range(MAX_ITERATIONS):
-                self._state_machine.transition_to(
-                    AgentState.RUNNING, f"iteration {iteration}"
-                )
-                # Build context with three-tier memory assembly (short/mid/long-term)
-                messages = await self._context_manager.build_context(
-                    session_id, user_content, system_prompt
-                )
+            try:
+                self._state_machine.start()
+                last_partial_text = ""
+                for iteration in range(MAX_ITERATIONS):
+                    self._state_machine.transition_to(
+                        AgentState.RUNNING, f"iteration {iteration}"
+                    )
+                    # Build context with three-tier memory assembly (short/mid/long-term)
+                    messages = await self._context_manager.build_context(
+                        session_id, user_content, system_prompt
+                    )
 
-                tool_defs = self._tools.all()
-                openai_tools = self._tools.to_openai_tools() if tool_defs else None
-                anthropic_tools = self._tools.to_anthropic_tools() if tool_defs else None
-                tools_arg = (
-                    anthropic_tools
-                    if isinstance(self._llm, AnthropicLlmClient)
-                    else openai_tools
-                )
+                    tool_defs = self._tools.all()
+                    openai_tools = self._tools.to_openai_tools() if tool_defs else None
+                    anthropic_tools = self._tools.to_anthropic_tools() if tool_defs else None
+                    tools_arg = (
+                        anthropic_tools
+                        if isinstance(self._llm, AnthropicLlmClient)
+                        else openai_tools
+                    )
 
-                pending_calls: list[dict[str, Any]] = []
-                assistant_text_acc: list[str] = []
-                end_evt: EndEvent | None = None
-                stream_failed: Exception | None = None
+                    pending_calls: list[dict[str, Any]] = []
+                    assistant_text_acc: list[str] = []
+                    end_evt: EndEvent | None = None
+                    stream_failed: Exception | None = None
 
-                try:
-                    async for evt in self._llm.stream_chat(messages, tools=tools_arg):
-                        if isinstance(evt, TextEvent):
-                            assistant_text_acc.append(evt.delta)
-                            yield {"event": "token", "data": {"text": evt.delta}}
-                            async for ne in self._drain_notify(notify_queue):
-                                yield ne
-                        elif isinstance(evt, ToolCallEvent):
-                            pending_calls.append(
-                                {"id": evt.id, "name": evt.name, "arguments": evt.arguments}
+                    try:
+                        async for evt in self._llm.stream_chat(messages, tools=tools_arg):
+                            if isinstance(evt, TextEvent):
+                                assistant_text_acc.append(evt.delta)
+                                yield {"event": "token", "data": {"text": evt.delta}}
+                                async for ne in self._drain_notify(notify_queue):
+                                    yield ne
+                            elif isinstance(evt, ToolCallEvent):
+                                pending_calls.append(
+                                    {"id": evt.id, "name": evt.name, "arguments": evt.arguments}
+                                )
+                            elif isinstance(evt, UsageEvent):
+                                self._budget.record(evt.usage)
+                                logger.debug(
+                                    "usage recorded: prompt=%d completion=%d",
+                                    evt.usage.prompt_tokens,
+                                    evt.usage.completion_tokens,
+                                )
+                            elif isinstance(evt, EndEvent):
+                                end_evt = evt
+                    except Exception as exc:  # noqa: BLE001
+                        # LLM 流半路异常:把已经收到的文本 / tool_calls 落库,然后告诉前端。
+                        # 重要:这里 *不* 捕 BaseException —— ``asyncio.CancelledError`` /
+                        # ``KeyboardInterrupt`` 必须直接冒泡到 finally,保留协作取消语义。
+                        logger.exception("stream_chat failed mid-stream")
+                        stream_failed = exc
+
+                    async for ne in self._drain_notify(notify_queue):
+                        yield ne
+
+                    assistant_text = "".join(assistant_text_acc)
+                    last_partial_text = assistant_text
+
+                    # ---- 没工具调用:写完 assistant 直接结束本次 converse ----
+                    if not pending_calls:
+                        if assistant_text:
+                            await self._store.append_message(
+                                session_id, "assistant", assistant_text
                             )
-                        elif isinstance(evt, UsageEvent):
-                            # Record usage for dynamic budget calibration and persistence
-                            self._budget.record(evt.usage)
-                            logger.debug(
-                                "usage recorded: prompt=%d completion=%d",
-                                evt.usage.prompt_tokens,
-                                evt.usage.completion_tokens,
+                        if stream_failed is not None:
+                            yield {
+                                "event": "error",
+                                "data": {
+                                    "message": str(stream_failed),
+                                    "type": type(stream_failed).__name__,
+                                },
+                            }
+                            return
+                        stop_reason = end_evt.stop_reason if end_evt else "stop"
+                        if assistant_text:
+                            await self._auto_remember(
+                                session_id, user_content, assistant_text, channel
                             )
-                        elif isinstance(evt, EndEvent):
-                            end_evt = evt
-                except Exception as exc:  # noqa: BLE001
-                    # LLM 流半路异常:把已经收到的文本 / tool_calls 落库,然后告诉前端。
-                    # 不写库的话,前端拿到的 token 已经渲染但 history 没有这条 assistant,
-                    # 下一轮会出现"用户视角看到了 PRTS 说话但 LLM 视角没说过"的悖论。
-                    # 重要:这里 *不* 捕 BaseException —— ``asyncio.CancelledError`` /
-                    # ``KeyboardInterrupt`` 必须直接冒泡到 finally,保留协作取消语义,
-                    # 否则 uvicorn shutdown / 客户端断开都会被吞,半成品状态反而被持久化。
-                    logger.exception("stream_chat failed mid-stream")
-                    stream_failed = exc
+                        self._state_machine.complete("done")
+                        yield {
+                            "event": "done",
+                            "data": {
+                                "session_id": session_id,
+                                "stop_reason": stop_reason,
+                                "state": self._state_machine.to_dict(),
+                            },
+                        }
+                        return
 
-                # 一轮 LLM 流结束。先把队列里残留的 notify 全部 flush 出去。
-                async for ne in self._drain_notify(notify_queue):
-                    yield ne
-
-                assistant_text = "".join(assistant_text_acc)
-
-                # ---- 没工具调用:写完 assistant 直接结束本次 converse ----
-                if not pending_calls:
-                    if assistant_text:
-                        await self._store.append_message(
-                            session_id, "assistant", assistant_text
+                    # ---- 有工具调用:发事件 → invoke → 收结果 ----
+                    # stream 失败时不执行工具调用（可能基于不完整的 LLM 输出）
+                    if stream_failed is not None and pending_calls:
+                        logger.warning(
+                            "stream failed with %d pending tool_calls, skipping dispatch",
+                            len(pending_calls),
                         )
+                        if assistant_text:
+                            await self._store.append_message(
+                                session_id, "assistant", assistant_text
+                            )
+                        yield {
+                            "event": "error",
+                            "data": {
+                                "message": str(stream_failed),
+                                "type": type(stream_failed).__name__,
+                            },
+                        }
+                        return
+
+                    self._state_machine.transition_to(
+                        AgentState.AWAITING_TOOL,
+                        f"{len(pending_calls)} tool_calls pending",
+                    )
+                    for call in pending_calls:
+                        yield {
+                            "event": "tool_call",
+                            "data": {
+                                "id": call["id"],
+                                "name": call["name"],
+                                "arguments": call["arguments"],
+                            },
+                        }
+
+                    hooked_tools = HookedToolRegistry(
+                        inner=self._tools,
+                        hooks=self._hooks,
+                        session_id=session_id,
+                        channel=channel,
+                        timeout_seconds=60.0,
+                        max_concurrent=4,
+                    )
+
+                    tool_outcomes: list[tuple[dict[str, Any], ToolResult]] = []
+                    for call in pending_calls:
+                        result = await hooked_tools.invoke(
+                            call["name"], call["arguments"]
+                        )
+                        tool_outcomes.append((call, result))
+                        yield {
+                            "event": "tool_result",
+                            "data": {
+                                "id": call["id"],
+                                "name": call["name"],
+                                **result.to_sse_dict(),
+                            },
+                        }
+                        async for ne in self._drain_notify(notify_queue):
+                            yield ne
+
+                    # ---- 一次事务把 assistant + 所有 tool 行写下去 ----
+                    safe_content = assistant_text if assistant_text.strip() else "(调用工具中...)"
+                    assistant_meta: dict[str, Any] = {"tool_calls": pending_calls}
+                    raw_msg = end_evt.raw_assistant_message if end_evt else {}
+                    reasoning = raw_msg.get("reasoning_content", "")
+                    if reasoning:
+                        assistant_meta["reasoning_content"] = reasoning
+                    batch: list[PendingMessage] = [
+                        PendingMessage(
+                            role="assistant",
+                            content=safe_content,
+                            meta=assistant_meta,
+                        )
+                    ]
+                    for call, result in tool_outcomes:
+                        batch.append(
+                            PendingMessage(
+                                role="tool",
+                                content=_truncate_for_llm(result.to_llm_text()),
+                                meta={
+                                    "tool_call_id": call["id"],
+                                    "tool_name": call["name"],
+                                    "is_error": result.is_error,
+                                    "error_type": result.error_type,
+                                },
+                            )
+                        )
+                    await self._store.append_messages(session_id, batch)
+
                     if stream_failed is not None:
                         yield {
                             "event": "error",
@@ -362,140 +477,51 @@ class AgentLoop:
                             },
                         }
                         return
-                    # finish_reason=length 也算 done:LLM 因为 max_tokens 截断,
-                    # 把已经吐出的内容当成最终答复;由前端决定是否提示用户重试。
-                    stop_reason = end_evt.stop_reason if end_evt else "stop"
-                    if assistant_text:
-                        await self._auto_remember(
-                            session_id, user_content, assistant_text, channel
-                        )
-                    self._state_machine.complete("done")
-                    yield {
-                        "event": "done",
-                        "data": {
-                            "session_id": session_id,
-                            "stop_reason": stop_reason,
-                            "state": self._state_machine.to_dict(),
-                        },
-                    }
-                    return
 
-                # ---- 有工具调用:发事件 → invoke → 收结果 ----
-                self._state_machine.transition_to(
-                    AgentState.AWAITING_TOOL,
-                    f"{len(pending_calls)} tool_calls pending",
+                    if end_evt is None:
+                        logger.warning("LLM stream ended without EndEvent")
+
+                # 触底:工具循环过深。补一行 assistant 收尾,避免悬挂 tool_calls。
+                self._state_machine.fail(f"exceeded {MAX_ITERATIONS} iterations")
+                cap_msg = f"(已达到工具循环上限 {MAX_ITERATIONS} 次,放弃后续调用。)"
+                if last_partial_text.strip():
+                    cap_msg = last_partial_text + "\n\n" + cap_msg
+                await self._store.append_message(
+                    session_id,
+                    "assistant",
+                    cap_msg,
                 )
-                # 先 yield 所有 tool_call 事件让 UI 立刻看到;之后顺序执行,
-                # 每个 tool_result 事件都立刻 yield 出去,保留交互实时性。
-                for call in pending_calls:
-                    yield {
-                        "event": "tool_call",
-                        "data": {
-                            "id": call["id"],
-                            "name": call["name"],
-                            "arguments": call["arguments"],
-                        },
-                    }
+                yield {
+                    "event": "error",
+                    "data": {
+                        "message": f"agent loop exceeded {MAX_ITERATIONS} iterations",
+                        "state": self._state_machine.to_dict(),
+                    },
+                }
+            except Exception:
+                self._state_machine.fail("unexpected exception")
+                raise
+            finally:
+                if self._state_machine.state not in (
+                    AgentState.COMPLETED,
+                    AgentState.ERROR,
+                    AgentState.CANCELLED,
+                ):
+                    self._state_machine.complete("converse ended")
+                unbind_notify_queue(nq_token)
+                prts_reset(ctx_token)
 
-                # 每次 converse 动态创建 HookedToolRegistry 以传入当前 session/channel
-                hooked_tools = HookedToolRegistry(
-                    inner=self._tools,
-                    hooks=self._hooks,
-                    session_id=session_id,
-                    channel=channel,
-                    timeout_seconds=60.0,  # 单个工具最多 60 秒
-                    max_concurrent=4,      # 最多同时执行 4 个工具
-                )
-
-                tool_outcomes: list[tuple[dict[str, Any], ToolResult]] = []
-                for call in pending_calls:
-                    result = await hooked_tools.invoke(
-                        call["name"], call["arguments"]
-                    )
-                    # result 一定是 ToolResult,不会抛异常
-                    tool_outcomes.append((call, result))
-                    yield {
-                        "event": "tool_result",
-                        "data": {
-                            "id": call["id"],
-                            "name": call["name"],
-                            **result.to_sse_dict(),
-                        },
-                    }
-                    async for ne in self._drain_notify(notify_queue):
-                        yield ne
-
-                # ---- 一次事务把 assistant + 所有 tool 行写下去 ----
-                # 这样要么本轮的 (assistant + 全部 tool_results) 整体在 history 里,
-                # 要么完全不在,绝不会出现 assistant 有 tool_calls 而 tool_result 缺失。
-                # DeepSeek 要求 assistant 消息有非空 content，即使只有 tool_calls
-                safe_content = assistant_text if assistant_text.strip() else "(调用工具中...)"
-                assistant_meta: dict[str, Any] = {"tool_calls": pending_calls}
-                # DeepSeek V4: 保存 reasoning_content 用于多轮对话传回
-                reasoning = getattr(self._llm, "last_reasoning_content", "")
-                if reasoning:
-                    assistant_meta["reasoning_content"] = reasoning
-                batch: list[PendingMessage] = [
-                    PendingMessage(
-                        role="assistant",
-                        content=safe_content,
-                        meta=assistant_meta,
-                    )
-                ]
-                for call, result in tool_outcomes:
-                    batch.append(
-                        PendingMessage(
-                            role="tool",
-                            content=_truncate_for_llm(result.to_llm_text()),
-                            meta={
-                                "tool_call_id": call["id"],
-                                "tool_name": call["name"],
-                                "is_error": result.is_error,
-                                "error_type": result.error_type,
-                            },
-                        )
-                    )
-                await self._store.append_messages(session_id, batch)
-
-                if stream_failed is not None:
-                    yield {
-                        "event": "error",
-                        "data": {
-                            "message": str(stream_failed),
-                            "type": type(stream_failed).__name__,
-                        },
-                    }
-                    return
-
-                if end_evt is None:
-                    logger.warning("LLM stream ended without EndEvent")
-
-            # 触底:工具循环过深。补一行 assistant 收尾,避免悬挂 tool_calls。
-            self._state_machine.fail(f"exceeded {MAX_ITERATIONS} iterations")
-            await self._store.append_message(
-                session_id,
-                "assistant",
-                f"(已达到工具循环上限 {MAX_ITERATIONS} 次,放弃后续调用。)",
-            )
-            yield {
-                "event": "error",
-                "data": {
-                    "message": f"agent loop exceeded {MAX_ITERATIONS} iterations",
-                    "state": self._state_machine.to_dict(),
-                },
-            }
+    async def _maybe_set_default_title(self, session_id: str, user_content: str) -> None:
+        """如果会话还没有 title,用用户消息前 30 字符设为默认标题。"""
+        try:
+            sessions = await self._store.list_sessions(limit=200)
+            current = next((s for s in sessions if s["id"] == session_id), None)
+            if current and not current.get("title"):
+                title = user_content[:30].replace("\n", " ").strip()
+                if title:
+                    await self._store.update_session_title(session_id, title)
         except Exception:
-            self._state_machine.fail("unexpected exception")
-            raise
-        finally:
-            if self._state_machine.state not in (
-                AgentState.COMPLETED,
-                AgentState.ERROR,
-                AgentState.CANCELLED,
-            ):
-                self._state_machine.complete("converse ended")
-            unbind_notify_queue(nq_token)
-            prts_reset(ctx_token)
+            logger.debug("failed to set default title for %s", session_id, exc_info=True)
 
     async def _auto_remember(
         self,
@@ -513,7 +539,7 @@ class AgentLoop:
             if not vec:
                 # Embedding API 不可用,跳过
                 return
-            mem_id = f"{session_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+            mem_id = f"{session_id}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
             await self._tools.invoke(
                 "prts-vector__upsert",
                 {
@@ -527,6 +553,7 @@ class AgentLoop:
                 },
             )
             logger.debug("auto-remember %s ok", mem_id)
+            self._context_manager.invalidate_recall_cache(session_id)
         except Exception:
             logger.exception("auto-remember failed")
 

@@ -176,13 +176,32 @@ _RATE_LIMIT_WINDOW = 60.0  # 60 秒窗口
 _RATE_LIMIT_MAX = 120      # 每窗口最多 120 请求(约 2 req/s 均值)
 _rate_limit_buckets: dict[str, list[float]] = defaultdict(list)
 
+# 敏感端点:仅允许 localhost 访问(防止外部调用执行 task / 重载 MCP / 重扫 skills)
+_LOCALHOST_ONLY_PREFIXES = (
+    "/agent/v1/events/",   # /events/cron, /events/fs
+    "/agent/v1/mcp/reload",
+    "/agent/v1/mcp/health-check",
+)
+_LOCALHOST_IPS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 
 @app.middleware("http")
 async def rate_limit_middleware(request, call_next):
     """基于 IP 的简单滑动窗口限流。超限返回 429 Too Many Requests。"""
-    # 只限流外部请求(跳过本地健康检查)
     client_host = request.client.host if request.client else ""
-    if client_host in ("127.0.0.1", "::1") and request.url.path == "/health":
+
+    # 敏感端点:仅允许 localhost 访问(防止外部调用执行 task / 重载 MCP / 重扫 skills)
+    request_path = request.url.path
+    if any(request_path.startswith(p) for p in _LOCALHOST_ONLY_PREFIXES):
+        if client_host not in _LOCALHOST_IPS:
+            from starlette.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=403,
+                content={"error": "forbidden: this endpoint is localhost-only"},
+            )
+
+    if client_host in ("127.0.0.1", "::1") and request_path == "/health":
         return await call_next(request)
 
     now = _time()
