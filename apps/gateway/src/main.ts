@@ -3,6 +3,7 @@ import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import os from "node:os";
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { createTelegramBot, createWebhookHandler, startTelegramBot } from "./adapters/telegram.js";
@@ -34,6 +35,33 @@ app.get<{ Params: { id: string } }>("/sessions/:id/history", async (req, reply) 
 // P8: 透传到 agent: GET /agent/v1/sessions/:id/summaries
 app.get<{ Params: { id: string } }>("/sessions/:id/summaries", async (req, reply) => {
   const resp = await fetch(`${AGENT_URL}/agent/v1/sessions/${encodeURIComponent(req.params.id)}/summaries`);
+  reply.code(resp.status).type("application/json").send(await resp.text());
+});
+
+// 透传到 agent: GET /agent/v1/sessions (列表)
+app.get<{ Querystring: { channel?: string; limit?: number; offset?: number } }>("/sessions", async (req, reply) => {
+  const params = new URLSearchParams();
+  if (req.query.channel) params.set("channel", req.query.channel);
+  if (req.query.limit) params.set("limit", String(req.query.limit));
+  if (req.query.offset) params.set("offset", String(req.query.offset));
+  const qs = params.toString();
+  const resp = await fetch(`${AGENT_URL}/agent/v1/sessions${qs ? `?${qs}` : ""}`);
+  reply.code(resp.status).type("application/json").send(await resp.text());
+});
+
+// 透传到 agent: DELETE /agent/v1/sessions/:id
+app.delete<{ Params: { id: string } }>("/sessions/:id", async (req, reply) => {
+  const resp = await fetch(`${AGENT_URL}/agent/v1/sessions/${encodeURIComponent(req.params.id)}`, { method: "DELETE" });
+  reply.code(resp.status).type("application/json").send(await resp.text());
+});
+
+// 透传到 agent: PATCH /agent/v1/sessions/:id (重命名)
+app.patch<{ Params: { id: string } }>("/sessions/:id", async (req, reply) => {
+  const resp = await fetch(`${AGENT_URL}/agent/v1/sessions/${encodeURIComponent(req.params.id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(req.body),
+  });
   reply.code(resp.status).type("application/json").send(await resp.text());
 });
 
@@ -275,26 +303,37 @@ if (botToken) {
 }
 
 // Serve dashboard static files (production build from apps/dashboard/dist)
-await app.register(fastifyStatic, {
-  root: DASHBOARD_DIST,
-  prefix: "/",
-});
+const dashboardExists = fs.existsSync(path.join(DASHBOARD_DIST, "index.html"));
+if (dashboardExists) {
+  await app.register(fastifyStatic, {
+    root: DASHBOARD_DIST,
+    prefix: "/",
+  });
 
-// SPA fallback: serve index.html for non-API routes (client-side routing)
-app.setNotFoundHandler(async (req, reply) => {
-  const url = req.url;
-  // Don't interfere with API/WebSocket/Telegram routes
-  if (
-    url.startsWith("/api/") ||
-    url.startsWith("/ws/") ||
-    url.startsWith("/telegram/") ||
-    url === "/health"
-  ) {
-    reply.code(404).send({ error: "Not Found" });
-    return;
-  }
-  return reply.sendFile("index.html", DASHBOARD_DIST);
-});
+  // SPA fallback: serve index.html for non-API routes (client-side routing)
+  app.setNotFoundHandler(async (req, reply) => {
+    const url = req.url;
+    if (
+      url.startsWith("/api/") ||
+      url.startsWith("/ws/") ||
+      url.startsWith("/telegram/") ||
+      url === "/health"
+    ) {
+      reply.code(404).send({ error: "Not Found" });
+      return;
+    }
+    return reply.sendFile("index.html", DASHBOARD_DIST);
+  });
+} else {
+  app.log.warn(`Dashboard dist not found at ${DASHBOARD_DIST}, serving API-only mode`);
+  app.setNotFoundHandler(async (req, reply) => {
+    reply.code(404).send({
+      error: "Dashboard not built",
+      hint: "Run `pnpm --filter dashboard build` to enable the web UI",
+      dashboard_dist: DASHBOARD_DIST,
+    });
+  });
+}
 
 try {
   await app.listen({ port: PORT, host: "127.0.0.1" });

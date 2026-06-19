@@ -89,6 +89,15 @@ class ContextManager:
         self._context_hits = 0
         self._context_misses = 0
 
+    def invalidate_recall_cache(self, session_id: str | None = None) -> None:
+        """清除向量召回缓存。新记忆写入后调用,避免返回过时结果。"""
+        if session_id is None:
+            self._recall_cache.clear()
+        else:
+            keys_to_del = [k for k in self._recall_cache if session_id in k]
+            for k in keys_to_del:
+                del self._recall_cache[k]
+
     async def build_context(
         self,
         session_id: str,
