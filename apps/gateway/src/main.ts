@@ -15,6 +15,49 @@ const AGENT_URL = process.env.AGENT_URL ?? `http://127.0.0.1:${process.env.AGENT
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DASHBOARD_DIST = path.join(__dirname, "..", "..", "dashboard", "dist");
 
+// ---- Single instance lock ----
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireLock(): string | null {
+  if (process.env.PRTS_ALLOW_MULTIPLE === "1") return null;
+
+  const workspace = process.env.PRTS_WORKSPACE_DIR || path.join(os.homedir(), ".prts", "workspace");
+  const lockPath = path.join(workspace, "gateway.lock");
+
+  if (fs.existsSync(lockPath)) {
+    try {
+      const oldPid = parseInt(fs.readFileSync(lockPath, "utf-8").trim(), 10);
+      if (!isNaN(oldPid) && isProcessAlive(oldPid)) {
+        console.error(`Gateway already running (PID ${oldPid}). Set PRTS_ALLOW_MULTIPLE=1 to override.`);
+        process.exit(1);
+      }
+    } catch {
+      // corrupt lock file, overwrite
+    }
+  }
+
+  fs.writeFileSync(lockPath, String(process.pid));
+  return lockPath;
+}
+
+function releaseLock(lockPath: string | null): void {
+  if (lockPath && fs.existsSync(lockPath)) {
+    try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+  }
+}
+
+const _lockPath = acquireLock();
+process.on("exit", () => releaseLock(_lockPath));
+process.on("SIGINT", () => { releaseLock(_lockPath); process.exit(0); });
+process.on("SIGTERM", () => { releaseLock(_lockPath); process.exit(0); });
+
 const app = Fastify({ logger: true });
 
 await app.register(websocket);

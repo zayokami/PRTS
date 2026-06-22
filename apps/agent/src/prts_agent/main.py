@@ -267,8 +267,83 @@ async def health() -> dict[str, object]:
     }
 
 
+def _is_process_alive(pid: int) -> bool:
+    """检查 PID 对应的进程是否仍在运行。"""
+    try:
+        if os.name == "nt":
+            # Windows: OpenProcess 检测
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            SYNCHRONIZE = 0x00100000
+            handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return False
+        else:
+            os.kill(pid, 0)
+            return True
+    except (OSError, ProcessLookupError, PermissionError):
+        return False
+
+
+def _acquire_single_instance_lock() -> str | None:
+    """尝试获取单实例锁。返回 lock 文件路径(成功) 或 None(已有实例/跳过)。
+
+    当 ``PRTS_ALLOW_MULTIPLE=1`` 时跳过检查。
+    已有实例运行时返回 None。
+    """
+    if os.getenv("PRTS_ALLOW_MULTIPLE", "0") == "1":
+        return None
+
+    workspace = resolve_workspace_dir()
+    lock_path = os.path.join(workspace, "agent.lock")
+
+    if os.path.exists(lock_path):
+        try:
+            with open(lock_path, "r") as f:
+                old_pid = int(f.read().strip())
+            if _is_process_alive(old_pid):
+                logger.error(
+                    "Agent already running (PID %d). "
+                    "Set PRTS_ALLOW_MULTIPLE=1 to override.",
+                    old_pid,
+                )
+                return None
+        except (ValueError, IOError):
+            pass
+
+    with open(lock_path, "w") as f:
+        f.write(str(os.getpid()))
+    return lock_path
+
+
+def _release_lock(lock_path: str | None) -> None:
+    if lock_path and os.path.exists(lock_path):
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
+
+
 def run() -> None:
     """uvicorn 启动入口,被 [project.scripts].prts-agent 调用。"""
+    lock_path = _acquire_single_instance_lock()
+    if lock_path is None and os.getenv("PRTS_ALLOW_MULTIPLE", "0") != "1":
+        raise SystemExit(1)
+
+    import atexit
+    import signal
+
+    atexit.register(_release_lock, lock_path)
+
+    def _signal_handler(signum, frame):  # type: ignore[no-untyped-def]
+        _release_lock(lock_path)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     import uvicorn
 
     port = int(os.getenv("AGENT_PORT", "4788"))

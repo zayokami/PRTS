@@ -33,6 +33,7 @@ db/*.db-shm
 apps/agent/db/
 logs/
 *.log
+*.lock
 
 # editor
 .vscode/
