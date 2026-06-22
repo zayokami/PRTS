@@ -404,9 +404,12 @@ def _sse_safe_dumps(data: Any) -> str:
 @router.post("/converse")
 async def converse(req: ConverseRequest, request: Request) -> EventSourceResponse:
     """核心对话接口:接收用户消息,通过 AgentLoop 流式返回 SSE 事件。"""
+    import asyncio
+
     workspace_dir = request.app.state.workspace_dir
     system_prompt = load_system_prompt(workspace_dir)
     loop = _loop(request)
+    abort_signal = asyncio.Event()
 
     async def event_stream() -> AsyncIterator[dict[str, str]]:
         try:
@@ -416,13 +419,14 @@ async def converse(req: ConverseRequest, request: Request) -> EventSourceRespons
                 system_prompt=system_prompt,
                 channel=req.channel,
                 user_ref=req.user_ref,
+                abort_signal=abort_signal,
             ):
-                # 客户端断开时停止生成,避免 LLM 浪费 + DB 写盘成本
                 if await request.is_disconnected():
                     logger.info(
                         "client disconnected, aborting converse for session=%s",
                         req.session_id,
                     )
+                    abort_signal.set()
                     break
                 yield {"event": evt["event"], "data": _sse_safe_dumps(evt["data"])}
         except Exception as exc:  # noqa: BLE001

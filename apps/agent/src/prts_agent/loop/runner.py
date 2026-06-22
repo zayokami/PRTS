@@ -27,11 +27,14 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from prts.context import CallContext as PrtsCallContext
 from prts.context import reset as prts_reset
 from prts.context import set as prts_set
+
+if TYPE_CHECKING:
+    from ..llm.model_compat import ModelCompatConfig
 
 from ..llm import (
     ChatMessage,
@@ -70,17 +73,28 @@ RECENT_WINDOW = 20  # 见 context_manager.DEFAULT_RECENT_WINDOW
 VECTOR_TOPK = 5     # 见 context_manager.DEFAULT_VECTOR_TOPK
 
 
-def _stored_to_chat(messages: list) -> list[ChatMessage]:
-    """SQLite ``StoredMessage`` → LLM ``ChatMessage``(OpenAI 风格)。"""
+def _stored_to_chat(
+    messages: list,
+    compat: "ModelCompatConfig | None" = None,
+) -> list[ChatMessage]:
+    """SQLite ``StoredMessage`` → LLM ``ChatMessage``(OpenAI 风格)。
+
+    ``compat`` 提供模型兼容性标志,驱动 reasoning_content / 非空 content 等行为。
+    """
+    if compat is None:
+        from ..llm.model_compat import ModelCompatConfig
+
+        compat = ModelCompatConfig()
     out: list[ChatMessage] = []
     for m in messages:
         if m.role == "assistant":
-            # DeepSeek 要求 assistant 消息有非空 content
-            content = m.content if m.content and m.content.strip() else "(调用工具中...)"
+            if compat.requires_nonempty_assistant_content:
+                content = m.content if m.content and m.content.strip() else "(调用工具中...)"
+            else:
+                content = m.content or ""
             msg: ChatMessage = {"role": "assistant", "content": content}
             if m.meta:
                 if m.meta.get("tool_calls"):
-                    # OpenAI 格式要求每个 tool_call 必须有 type="function"
                     msg["tool_calls"] = [
                         {
                             "id": tc["id"],
@@ -92,8 +106,7 @@ def _stored_to_chat(messages: list) -> list[ChatMessage]:
                         }
                         for tc in m.meta["tool_calls"]
                     ]
-                # DeepSeek V4: 传递 reasoning_content
-                if m.meta.get("reasoning_content"):
+                if compat.requires_reasoning_in_history and m.meta.get("reasoning_content"):
                     msg["reasoning_content"] = m.meta["reasoning_content"]
             out.append(msg)
         elif m.role == "tool":
@@ -264,8 +277,16 @@ class AgentLoop:
         *,
         channel: str = "web",
         user_ref: str | None = None,
+        abort_signal: asyncio.Event | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yields SSE-friendly dicts: ``{"event": str, "data": dict}``。"""
+        """Yields SSE-friendly dicts: ``{"event": str, "data": dict}``。
+
+        ``abort_signal`` 被 set 时,loop 在下一个 await 点优雅退出,
+        已产生的文本和 tool 结果会被持久化。
+        """
+        def _aborted() -> bool:
+            return abort_signal is not None and abort_signal.is_set()
+
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             await self._store.ensure_session(session_id, channel=channel, user_ref=user_ref)
@@ -293,6 +314,9 @@ class AgentLoop:
                 self._state_machine.start()
                 last_partial_text = ""
                 for iteration in range(MAX_ITERATIONS):
+                    if _aborted():
+                        logger.info("abort signal received, stopping agent loop")
+                        break
                     self._state_machine.transition_to(
                         AgentState.RUNNING, f"iteration {iteration}"
                     )
@@ -316,7 +340,12 @@ class AgentLoop:
                     stream_failed: Exception | None = None
 
                     try:
-                        async for evt in self._llm.stream_chat(messages, tools=tools_arg):
+                        async for evt in self._llm.stream_chat(
+                            messages, tools=tools_arg, abort_signal=abort_signal
+                        ):
+                            if _aborted():
+                                logger.info("abort signal received during LLM stream, stopping")
+                                break
                             if isinstance(evt, TextEvent):
                                 assistant_text_acc.append(evt.delta)
                                 yield {"event": "token", "data": {"text": evt.delta}}
@@ -424,6 +453,9 @@ class AgentLoop:
 
                     tool_outcomes: list[tuple[dict[str, Any], ToolResult]] = []
                     for call in pending_calls:
+                        if _aborted():
+                            logger.info("abort signal received before tool %s, skipping", call["name"])
+                            break
                         result = await hooked_tools.invoke(
                             call["name"], call["arguments"]
                         )
@@ -440,12 +472,17 @@ class AgentLoop:
                             yield ne
 
                     # ---- 一次事务把 assistant + 所有 tool 行写下去 ----
-                    safe_content = assistant_text if assistant_text.strip() else "(调用工具中...)"
+                    compat = self._llm.compat
+                    if compat.requires_nonempty_assistant_content:
+                        safe_content = assistant_text if assistant_text.strip() else "(调用工具中...)"
+                    else:
+                        safe_content = assistant_text
                     assistant_meta: dict[str, Any] = {"tool_calls": pending_calls}
-                    raw_msg = end_evt.raw_assistant_message if end_evt else {}
-                    reasoning = raw_msg.get("reasoning_content", "")
-                    if reasoning:
-                        assistant_meta["reasoning_content"] = reasoning
+                    if compat.requires_reasoning_in_history:
+                        raw_msg = end_evt.raw_assistant_message if end_evt else {}
+                        reasoning = raw_msg.get("reasoning_content", "")
+                        if reasoning:
+                            assistant_meta["reasoning_content"] = reasoning
                     batch: list[PendingMessage] = [
                         PendingMessage(
                             role="assistant",

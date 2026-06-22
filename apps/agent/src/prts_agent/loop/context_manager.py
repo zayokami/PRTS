@@ -318,13 +318,15 @@ class ContextManager:
             )
 
         # 最近消息
+        compat = self._llm.compat
         for m in recent:
-            # DeepSeek 要求 assistant 消息有非空 content
-            content = m.content if m.content and m.content.strip() else "(调用工具中...)"
+            if compat.requires_nonempty_assistant_content and m.role == "assistant":
+                content = m.content if m.content and m.content.strip() else "(调用工具中...)"
+            else:
+                content = m.content or ""
             msg: ChatMessage = {"role": m.role, "content": content}
             if m.meta:
                 if m.meta.get("tool_calls"):
-                    # OpenAI 格式要求每个 tool_call 必须有 type="function"
                     msg["tool_calls"] = [
                         {
                             "id": tc["id"],
@@ -336,8 +338,7 @@ class ContextManager:
                         }
                         for tc in m.meta["tool_calls"]
                     ]
-                # DeepSeek V4: 传递 reasoning_content 用于多轮对话
-                if m.meta.get("reasoning_content"):
+                if compat.requires_reasoning_in_history and m.meta.get("reasoning_content"):
                     msg["reasoning_content"] = m.meta["reasoning_content"]
                 if m.meta.get("tool_call_id"):
                     msg["tool_call_id"] = m.meta["tool_call_id"]

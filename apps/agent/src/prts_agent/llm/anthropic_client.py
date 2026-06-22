@@ -140,6 +140,7 @@ class AnthropicLlmClient(LlmClient):
         self,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
+        abort_signal: Any = None,
     ) -> AsyncIterator[StreamEvent]:
         system, converted = _convert_messages(messages)
         kwargs: dict[str, Any] = {

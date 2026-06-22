@@ -46,6 +46,7 @@ class OpenAILlmClient(LlmClient):
         self,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
+        abort_signal: Any = None,
     ) -> AsyncIterator[StreamEvent]:
         kwargs: dict[str, Any] = {
             "model": self._model,
@@ -55,6 +56,13 @@ class OpenAILlmClient(LlmClient):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        if self.compat.supports_stream_options:
+            kwargs["stream_options"] = {"include_usage": True}
+        if self.compat.extra_request_params:
+            kwargs.update(self.compat.extra_request_params)
+
+        def _aborted() -> bool:
+            return abort_signal is not None and abort_signal.is_set()
 
         stream = await self._client.chat.completions.create(**kwargs)
 
@@ -66,6 +74,9 @@ class OpenAILlmClient(LlmClient):
         finish_reason: str | None = None
 
         async for chunk in stream:
+            if _aborted():
+                logger.info("abort signal received, stopping LLM stream")
+                break
             # Parse usage — location varies by provider:
             # - 标准 OpenAI: chunk.usage (最后一个 chunk)
             # - Groq: chunk.x_groq.usage
@@ -95,10 +106,10 @@ class OpenAILlmClient(LlmClient):
             if delta is None:
                 pass
             else:
-                # DeepSeek V4: 捕获 reasoning_content (多轮对话必须传回)
-                rc = getattr(delta, "reasoning_content", None)
-                if rc:
-                    reasoning_acc.append(rc)
+                if self.compat.thinking_format == "deepseek":
+                    rc = getattr(delta, "reasoning_content", None)
+                    if rc:
+                        reasoning_acc.append(rc)
 
                 if delta.content:
                     text_acc.append(delta.content)

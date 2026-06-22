@@ -16,7 +16,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypedDict, Union
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, Union
+
+if TYPE_CHECKING:
+    from .model_compat import ModelCompatConfig
 
 
 class ChatMessage(TypedDict, total=False):
@@ -82,12 +85,28 @@ class LlmClient(ABC):
     """LLM 客户端抽象接口。
 
     子类必须暴露 ``model`` (只读) 供上层做 token 预算管理。
-    P8 起支持 ``last_usage`` 读取上一次调用的实际 token 消耗。
+    ``compat`` 属性返回模型的兼容性配置,驱动 provider 特定行为。
     """
 
     def __init__(self) -> None:
         self._last_usage: TokenUsage | None = None
         self._last_reasoning_content: str = ""
+        self._compat: ModelCompatConfig | None = None
+
+    @property
+    @abstractmethod
+    def model(self) -> str:
+        """当前使用的模型标识字符串,如 ``"gpt-4o-mini"`` 或 ``"claude-sonnet-4-6"`` 。"""
+        raise NotImplementedError
+
+    @property
+    def compat(self) -> ModelCompatConfig:
+        """模型的兼容性配置。首次访问时按 model 名查找 registry。"""
+        if self._compat is None:
+            from .model_compat import get_compat
+
+            self._compat = get_compat(self.model)
+        return self._compat
 
     @property
     @abstractmethod
@@ -123,8 +142,12 @@ class LlmClient(ABC):
         self,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
+        abort_signal: Any = None,
     ) -> AsyncIterator[StreamEvent]:
-        """流式 chat。``tools`` 为 None 时退化为无工具普通对话。"""
+        """流式 chat。``tools`` 为 None 时退化为无工具普通对话。
+
+        ``abort_signal`` (asyncio.Event) 被 set 时,stream 在下一个 chunk 边界退出。
+        """
         raise NotImplementedError
 
     async def chat(
